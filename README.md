@@ -8,6 +8,10 @@ no server, no upload — your files never leave your browser.
 - **Shuffle** and three repeat modes (off / all / one)
 - **Export / Import** — move your whole library (tracks + playlists)
   between devices as a single portable file, no cloud involved
+- **Get free music** — search and download from Internet Archive's open
+  audio collections (Creative Commons and public-domain tracks, plus
+  live recordings artists have opened up for taping/sharing) — legally,
+  directly into your library
 - **Offline & installable** — a service worker caches the app shell, and
   your files + playlists are stored locally in IndexedDB, so once you've
   loaded a library, MattMusic opens and plays without a network connection
@@ -68,6 +72,32 @@ The `.mmlib` file is just your raw audio bytes plus a small JSON
 header describing titles and playlists — no re-encoding, no quality
 loss, and no external service ever sees it.
 
+## Get free music
+
+Tap **♫ Get free music** to search Internet Archive's open audio
+collections directly from inside MattMusic — no separate site, no
+account, and it's a straight call from your browser to
+`archive.org`'s public search API.
+
+- Results are scoped to items that are explicitly licensed for reuse
+  (Creative Commons or public domain — shown as a badge on each result)
+  or that belong to collections the Archive runs specifically for open
+  sharing, like **Netlabels** (independent labels that release under
+  CC) and the **Live Music Archive** (bands who've opted in to letting
+  their shows be taped and shared).
+- Opening a result shows its individual mp3 tracks; tapping ⬇ downloads
+  that one file straight into your library, same as loading a local
+  file.
+- This is the one part of MattMusic that needs an internet connection
+  — searching and downloading talk to archive.org directly. Everything
+  you've already added keeps working offline as usual.
+
+This is intentionally **not** a way to pull audio from arbitrary sites
+or streaming services — it's scoped to sources that are actually
+licensed for this. If there's a specific artist you're after who isn't
+on the Archive, the honest options are usually Bandcamp, an official
+purchase, or ripping a CD you own.
+
 ## Known limits
 
 - **Background playback with the screen fully off** depends on your
@@ -94,6 +124,15 @@ mattmusic/
 ```
 
 ## Changelog
+
+**Get free music**
+- Added a "♫ Get free music" search inside MattMusic, backed by
+  Internet Archive's public API — search, preview, and download
+  Creative Commons / public-domain / openly-shared tracks straight into
+  your library. See "Get free music" above for how it's scoped.
+- Bumped the service worker cache version again for this update, and
+  hardened it to never intercept cross-origin requests (like the new
+  archive.org calls), only the app's own same-origin files.
 
 **Export / Import**
 - Added a portable `.mmlib` library format so you can move your whole
