@@ -6,6 +6,8 @@ no server, no upload — your files never leave your browser.
 - **Library** — load mp3s (or m4a/wav/ogg/flac) from your device
 - **Playlists** — group tracks, add/remove freely, saved automatically
 - **Shuffle** and three repeat modes (off / all / one)
+- **Export / Import** — move your whole library (tracks + playlists)
+  between devices as a single portable file, no cloud involved
 - **Offline & installable** — a service worker caches the app shell, and
   your files + playlists are stored locally in IndexedDB, so once you've
   loaded a library, MattMusic opens and plays without a network connection
@@ -43,6 +45,29 @@ python3 -m http.server 8080
   code (HTML/CSS/JS/icons) so the app itself loads with no connection.
   It does not cache your music — that's already local, in IndexedDB.
 
+## Moving your library between devices
+
+MattMusic on your PC and MattMusic on your phone each keep their own
+local copy — nothing syncs automatically, by design (your files never
+leave the device you loaded them on). To bring a library from one
+device to another:
+
+1. On the source device, tap **↓ Export library**. This downloads a
+   single `mattmusic-library-YYYY-MM-DD.mmlib` file containing every
+   track and playlist.
+2. Get that file onto the other device — AirDrop, a cable, a cloud
+   drive, email to yourself, whatever you'd normally use to move a
+   file across.
+3. On the other device, open MattMusic and tap **↑ Import library**
+   (it's available from the empty state too, if that device has no
+   library yet). Importing merges into whatever's already there —
+   existing playlists with the same name get the new tracks added in,
+   rather than being overwritten.
+
+The `.mmlib` file is just your raw audio bytes plus a small JSON
+header describing titles and playlists — no re-encoding, no quality
+loss, and no external service ever sees it.
+
 ## Known limits
 
 - **Background playback with the screen fully off** depends on your
@@ -69,6 +94,13 @@ mattmusic/
 ```
 
 ## Changelog
+
+**Export / Import**
+- Added a portable `.mmlib` library format so you can move your whole
+  collection (tracks + playlists) between devices without a cloud
+  service — see "Moving your library between devices" above.
+- Bumped the service worker cache version so this update replaces any
+  previously cached app shell.
 
 **Rename + polish pass**
 - Renamed the app to MattMusic throughout (title, manifest, icons, DB
