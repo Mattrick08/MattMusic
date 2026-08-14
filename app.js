@@ -97,6 +97,7 @@
     if (currentId === id) { audio.pause(); audio.removeAttribute('src'); currentId = null; isPlaying = false; }
     updateFileCount();
     render();
+    if (track) showToast('Deleted "' + track.title + '"');
   }
 
   function updateFileCount() {
@@ -398,9 +399,10 @@
         const isPl = t.id === currentId;
         let actionBtn = '';
         if (activeView === 'library') {
-          if (Object.keys(playlists).length) {
-            actionBtn = `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`;
-          }
+          const addBtn = Object.keys(playlists).length
+            ? `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`
+            : '';
+          actionBtn = addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
         } else {
           actionBtn = `<button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
         }
@@ -460,7 +462,7 @@
     });
     content.querySelectorAll('[data-play]').forEach((el) => {
       el.addEventListener('click', (e) => {
-        if (e.target.closest('[data-add],[data-remove-from]')) return;
+        if (e.target.closest('[data-add],[data-remove-from],[data-delete]')) return;
         playTrack(el.dataset.play);
       });
     });
@@ -469,6 +471,16 @@
     });
     content.querySelectorAll('[data-remove-from]').forEach((el) => {
       el.addEventListener('click', (e) => { e.stopPropagation(); removeFromPlaylist(el.dataset.removeFrom, activeView); });
+    });
+    content.querySelectorAll('[data-delete]').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const track = getTrackById(el.dataset.delete);
+        const label = track ? track.title : 'this track';
+        if (confirm('Delete "' + label + '" from your library? This removes the file from this device.')) {
+          removeTrack(el.dataset.delete);
+        }
+      });
     });
 
     renderNowPlaying();
