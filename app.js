@@ -5,7 +5,7 @@
   const toastEl = document.getElementById('toast');
 
   // State
-  let library = [];          // {id, name, blob, url, title, duration}
+  let library = [];          // {id, name, blob, url, title, duration, addedAt}
   let playlists = {};         // name -> array of track ids
   let activeView = 'library'; // 'library' or playlist name
   let currentId = null;
@@ -14,6 +14,10 @@
   let repeatMode = 'off';     // off | all | one
   let shuffleOrder = [];
   let creatingPlaylist = false;
+  let searchQuery = '';
+  let sortMode = 'added';     // 'added' | 'alpha' | 'duration'
+  let selectMode = false;
+  let selectedIds = new Set();
 
   function fmtTime(s) {
     if (!isFinite(s) || s == null) return '0:00';
@@ -30,9 +34,21 @@
   }
 
   function currentList() {
-    if (activeView === 'library') return library;
-    const ids = playlists[activeView] || [];
-    return ids.map((id) => library.find((t) => t.id === id)).filter(Boolean);
+    const base = activeView === 'library'
+      ? library
+      : (playlists[activeView] || []).map((id) => library.find((t) => t.id === id)).filter(Boolean);
+
+    let list = base;
+    const q = searchQuery.trim().toLowerCase();
+    if (q) list = list.filter((t) => t.title.toLowerCase().includes(q));
+
+    list = list.slice().sort((a, b) => {
+      if (sortMode === 'alpha') return a.title.localeCompare(b.title);
+      if (sortMode === 'duration') return (a.duration || 0) - (b.duration || 0);
+      return (b.addedAt || 0) - (a.addedAt || 0); // recently added first
+    });
+
+    return list;
   }
 
   function getTrackById(id) {
@@ -45,6 +61,7 @@
     const stored = await DB.getAllTracks();
     stored.forEach((t) => {
       t.url = URL.createObjectURL(t.blob);
+      t.addedAt = t.addedAt || 0; // tracks saved before this field existed
       library.push(t);
     });
     const storedPlaylists = await DB.getAllPlaylists();
@@ -72,30 +89,42 @@
     const id = 'trk_' + Math.random().toString(36).slice(2, 10);
     const url = URL.createObjectURL(blob);
     const title = filename.replace(/\.[^/.]+$/, '');
-    const track = { id, name: filename, blob, url, title, duration: null };
+    const addedAt = Date.now();
+    const track = { id, name: filename, blob, url, title, duration: null, addedAt };
     library.push(track);
-    await DB.addTrack({ id, name: filename, blob, title, duration: null });
+    await DB.addTrack({ id, name: filename, blob, title, duration: null, addedAt });
 
     const probe = new Audio(url);
     probe.addEventListener('loadedmetadata', () => {
       track.duration = probe.duration;
-      DB.updateTrack({ id, name: filename, blob, title, duration: probe.duration });
+      DB.updateTrack({ id, name: filename, blob, title, duration: probe.duration, addedAt });
       render();
     });
     return track;
   }
 
+  async function bulkDeleteTracks(ids) {
+    const idSet = new Set(ids);
+    library = library.filter((t) => {
+      if (idSet.has(t.id)) { URL.revokeObjectURL(t.url); return false; }
+      return true;
+    });
+    Object.keys(playlists).forEach((name) => {
+      const before = playlists[name].length;
+      playlists[name] = playlists[name].filter((tid) => !idSet.has(tid));
+      if (playlists[name].length !== before) DB.savePlaylist(name, playlists[name]);
+    });
+    for (const id of ids) {
+      await DB.deleteTrack(id);
+      selectedIds.delete(id);
+    }
+    if (idSet.has(currentId)) { audio.pause(); audio.removeAttribute('src'); currentId = null; isPlaying = false; }
+    updateFileCount();
+  }
+
   async function removeTrack(id) {
     const track = getTrackById(id);
-    library = library.filter((t) => t.id !== id);
-    Object.keys(playlists).forEach((name) => {
-      playlists[name] = playlists[name].filter((tid) => tid !== id);
-      DB.savePlaylist(name, playlists[name]);
-    });
-    await DB.deleteTrack(id);
-    if (track) URL.revokeObjectURL(track.url); // bug fix: avoid leaking blob URLs
-    if (currentId === id) { audio.pause(); audio.removeAttribute('src'); currentId = null; isPlaying = false; }
-    updateFileCount();
+    await bulkDeleteTracks([id]);
     render();
     if (track) showToast('Deleted "' + track.title + '"');
   }
@@ -108,7 +137,7 @@
     const title = next.trim();
     if (!title || title === track.title) return;
     track.title = title;
-    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title, duration: track.duration });
+    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title, duration: track.duration, addedAt: track.addedAt });
     render();
     showToast('Renamed to "' + title + '"');
   }
@@ -136,7 +165,7 @@
     const meta = {
       tracks: library.map((t) => ({
         id: t.id, title: t.title, name: t.name,
-        mime: t.blob.type || 'audio/mpeg', size: t.blob.size, duration: t.duration
+        mime: t.blob.type || 'audio/mpeg', size: t.blob.size, duration: t.duration, addedAt: t.addedAt
       })),
       playlists
     };
@@ -184,8 +213,9 @@
         idMap[t.id] = newId;
 
         const url = URL.createObjectURL(blob);
-        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration });
-        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration });
+        const addedAt = t.addedAt || Date.now();
+        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration, addedAt });
+        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration, addedAt });
         added++;
       }
 
@@ -322,6 +352,60 @@
     render();
   }
 
+  // ---------- Bulk selection ----------
+
+  function toggleSelect(id) {
+    if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
+    render();
+  }
+
+  function selectAllVisible() {
+    const list = currentList();
+    const allSelected = list.length > 0 && list.every((t) => selectedIds.has(t.id));
+    if (allSelected) list.forEach((t) => selectedIds.delete(t.id));
+    else list.forEach((t) => selectedIds.add(t.id));
+    render();
+  }
+
+  async function bulkDelete() {
+    if (!selectedIds.size) return;
+    const ids = Array.from(selectedIds);
+    const n = ids.length;
+    if (!confirm('Delete ' + n + ' track' + (n === 1 ? '' : 's') + ' from your library? This removes the files from this device.')) return;
+    await bulkDeleteTracks(ids);
+    selectMode = false;
+    render();
+    showToast('Deleted ' + n + ' track' + (n === 1 ? '' : 's'));
+  }
+
+  function bulkAddToPlaylist() {
+    const names = Object.keys(playlists);
+    if (!names.length) { showToast('Create a playlist first'); return; }
+    const n = selectedIds.size;
+    const choice = names.length === 1 ? names[0] : prompt('Add ' + n + ' track' + (n === 1 ? '' : 's') + ' to which playlist?\n' + names.join(', '));
+    if (!choice || !playlists[choice]) return;
+    let added = 0;
+    selectedIds.forEach((id) => {
+      if (!playlists[choice].includes(id)) { playlists[choice].push(id); added++; }
+    });
+    DB.savePlaylist(choice, playlists[choice]);
+    selectedIds.clear();
+    selectMode = false;
+    render();
+    showToast('Added ' + added + ' track' + (added === 1 ? '' : 's') + ' to ' + choice);
+  }
+
+  function bulkRemoveFromPlaylist() {
+    const n = selectedIds.size;
+    if (!n) return;
+    playlists[activeView] = playlists[activeView].filter((id) => !selectedIds.has(id));
+    DB.savePlaylist(activeView, playlists[activeView]);
+    selectedIds.clear();
+    selectMode = false;
+    render();
+    showToast('Removed ' + n + ' track' + (n === 1 ? '' : 's') + ' from ' + activeView);
+  }
+
   // ---------- Media Session (lock screen controls) ----------
 
   function updateMediaSession(track) {
@@ -386,6 +470,10 @@
   }
 
   function render() {
+    // Preserve focus/cursor in the search box across the innerHTML rebuild below.
+    const searchFocused = document.activeElement && document.activeElement.id === 'searchInput';
+    const searchSel = searchFocused ? document.activeElement.selectionStart : null;
+
     const tabsHtml = ['library', ...Object.keys(playlists)].map((name) => {
       const label = name === 'library' ? 'Library' : escapeHtml(name);
       const del = name !== 'library' ? `<span class="del" data-del-playlist="${escapeHtml(name)}">✕</span>` : '';
@@ -402,26 +490,35 @@
           <p>Load mp3s from your device to start. They're stored on this device so they're here next time, even offline.</p>
           <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;">
             <button class="btn btn-primary" id="loadBtn">Choose files</button>
+            <button class="btn btn-ghost" id="loadFolderBtnEmpty">Add a folder</button>
             <button class="btn btn-ghost" id="importBtnEmpty">Import library file</button>
           </div>
         </div>`;
     } else if (list.length === 0) {
-      listHtml = `<div class="tracklist"><div class="empty-list">No tracks in "${escapeHtml(activeView)}" yet. Add some from your Library.</div></div>`;
+      listHtml = searchQuery.trim()
+        ? `<div class="tracklist"><div class="empty-list">No tracks match "${escapeHtml(searchQuery.trim())}".</div></div>`
+        : `<div class="tracklist"><div class="empty-list">No tracks in "${escapeHtml(activeView)}" yet. Add some from your Library.</div></div>`;
     } else {
       listHtml = `<div class="tracklist">` + list.map((t, i) => {
         const isPl = t.id === currentId;
+        const isSel = selectedIds.has(t.id);
         let actionBtn = '';
-        if (activeView === 'library') {
-          const addBtn = Object.keys(playlists).length
-            ? `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`
-            : '';
-          actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
-        } else {
-          actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button><button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
+        if (!selectMode) {
+          if (activeView === 'library') {
+            const addBtn = Object.keys(playlists).length
+              ? `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`
+              : '';
+            actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
+          } else {
+            actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button><button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
+          }
         }
         const eq = (isPl && isPlaying) ? '<span class="eq"><span></span><span></span><span></span></span>' : '';
-        return `<div class="track ${isPl ? 'playing' : ''}" data-play="${t.id}">
-          <span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>
+        const leading = selectMode
+          ? `<input type="checkbox" class="track-check" ${isSel ? 'checked' : ''} />`
+          : `<span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>`;
+        return `<div class="track ${isPl ? 'playing' : ''} ${isSel ? 'selected' : ''}" data-play="${t.id}">
+          ${leading}
           <div class="meta"><div class="title">${eq}${escapeHtml(t.title)}</div></div>
           <span class="dur">${t.duration ? fmtTime(t.duration) : '--:--'}</span>
           ${actionBtn}
@@ -435,21 +532,57 @@
         <button class="btn btn-primary" id="confirmNewPl">Create</button>
       </div>` : '';
 
+    const searchSortRow = library.length ? `
+      <div class="search-sort-row">
+        <input type="search" id="searchInput" class="search-input" placeholder="Search titles…" value="${escapeHtml(searchQuery)}" />
+        <select id="sortSelect" class="sort-select" title="Sort by">
+          <option value="added" ${sortMode === 'added' ? 'selected' : ''}>Recently added</option>
+          <option value="alpha" ${sortMode === 'alpha' ? 'selected' : ''}>Title (A–Z)</option>
+          <option value="duration" ${sortMode === 'duration' ? 'selected' : ''}>Duration</option>
+        </select>
+      </div>` : '';
+
+    let toolbarRow;
+    if (selectMode) {
+      const allVisibleSelected = list.length > 0 && list.every((t) => selectedIds.has(t.id));
+      const addAction = (activeView === 'library' && Object.keys(playlists).length)
+        ? `<button class="btn btn-ghost sm" id="bulkAddBtn">＋ Add to playlist</button>` : '';
+      const removeAction = activeView !== 'library'
+        ? `<button class="btn btn-ghost sm" id="bulkRemoveBtn">✕ Remove from playlist</button>` : '';
+      const deleteAction = activeView === 'library'
+        ? `<button class="btn btn-ghost sm danger" id="bulkDeleteBtn">🗑 Delete</button>` : '';
+      toolbarRow = `
+        <div class="bulk-bar">
+          <span class="bulk-count">${selectedIds.size} selected</span>
+          <button class="btn btn-ghost sm" id="selectAllBtn">${allVisibleSelected ? 'Deselect all' : 'Select all'}</button>
+          ${addAction}${removeAction}${deleteAction}
+          <button class="btn btn-ghost sm" id="cancelSelectBtn">Cancel</button>
+        </div>`;
+    } else {
+      toolbarRow = `
+        <div class="toolbar-row">
+          <button class="btn btn-ghost sm" id="loadMoreBtn">+ Add more files</button>
+          <button class="btn btn-ghost sm" id="loadFolderBtn">+ Add folder</button>
+          <button class="btn btn-ghost sm" id="selectModeBtn">☑ Select</button>
+          <button class="btn btn-ghost sm" id="exportBtn">↓ Export library</button>
+          <button class="btn btn-ghost sm" id="importBtn">↑ Import library</button>
+        </div>`;
+    }
+
     const header = library.length ? `
       <div class="tabs">${tabsHtml}</div>
       ${newPlaylistForm}
       <div class="section-label">${activeView === 'library' ? 'Your library' : escapeHtml(activeView)}</div>
-      <div class="toolbar-row">
-        <button class="btn btn-ghost sm" id="loadMoreBtn">+ Add more files</button>
-        <button class="btn btn-ghost sm" id="exportBtn">↓ Export library</button>
-        <button class="btn btn-ghost sm" id="importBtn">↑ Import library</button>
-      </div>
+      ${searchSortRow}
+      ${toolbarRow}
     ` : '';
 
     content.innerHTML = header + listHtml;
 
     document.getElementById('loadBtn')?.addEventListener('click', triggerFilePicker);
     document.getElementById('loadMoreBtn')?.addEventListener('click', triggerFilePicker);
+    document.getElementById('loadFolderBtn')?.addEventListener('click', triggerFolderPicker);
+    document.getElementById('loadFolderBtnEmpty')?.addEventListener('click', triggerFolderPicker);
     document.getElementById('exportBtn')?.addEventListener('click', exportLibrary);
     document.getElementById('importBtn')?.addEventListener('click', triggerImportPicker);
     document.getElementById('importBtnEmpty')?.addEventListener('click', triggerImportPicker);
@@ -463,11 +596,27 @@
     document.getElementById('newPlName')?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') createPlaylist(e.target.value);
     });
+    document.getElementById('searchInput')?.addEventListener('input', (e) => {
+      searchQuery = e.target.value; render();
+    });
+    document.getElementById('sortSelect')?.addEventListener('change', (e) => {
+      sortMode = e.target.value; render();
+    });
+    document.getElementById('selectModeBtn')?.addEventListener('click', () => {
+      selectMode = true; selectedIds.clear(); render();
+    });
+    document.getElementById('cancelSelectBtn')?.addEventListener('click', () => {
+      selectMode = false; selectedIds.clear(); render();
+    });
+    document.getElementById('selectAllBtn')?.addEventListener('click', selectAllVisible);
+    document.getElementById('bulkAddBtn')?.addEventListener('click', bulkAddToPlaylist);
+    document.getElementById('bulkRemoveBtn')?.addEventListener('click', bulkRemoveFromPlaylist);
+    document.getElementById('bulkDeleteBtn')?.addEventListener('click', bulkDelete);
 
     content.querySelectorAll('[data-view]').forEach((el) => {
       el.addEventListener('click', (e) => {
         if (e.target.closest('[data-del-playlist]')) return;
-        activeView = el.dataset.view; creatingPlaylist = false; render();
+        activeView = el.dataset.view; creatingPlaylist = false; selectMode = false; selectedIds.clear(); render();
       });
     });
     content.querySelectorAll('[data-del-playlist]').forEach((el) => {
@@ -476,6 +625,7 @@
     content.querySelectorAll('[data-play]').forEach((el) => {
       el.addEventListener('click', (e) => {
         if (e.target.closest('[data-add],[data-remove-from],[data-delete],[data-rename]')) return;
+        if (selectMode) { toggleSelect(el.dataset.play); return; }
         playTrack(el.dataset.play);
       });
     });
@@ -499,6 +649,11 @@
       });
     });
 
+    if (searchFocused) {
+      const si = document.getElementById('searchInput');
+      if (si) { si.focus(); si.setSelectionRange(searchSel, searchSel); }
+    }
+
     renderNowPlaying();
     syncBrandMark();
   }
@@ -515,6 +670,15 @@
     input.type = 'file';
     input.multiple = true;
     input.accept = 'audio/*';
+    input.addEventListener('change', (e) => loadFiles(e.target.files));
+    input.click();
+  }
+
+  function triggerFolderPicker() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.webkitdirectory = true; // recursive folder picker (Chrome/Edge/Safari; Firefox falls back to normal picker)
     input.addEventListener('change', (e) => loadFiles(e.target.files));
     input.click();
   }
