@@ -50,9 +50,7 @@
     const storedPlaylists = await DB.getAllPlaylists();
     storedPlaylists.forEach((p) => { playlists[p.name] = p.trackIds; });
 
-    fileCount.textContent = library.length
-      ? library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device'
-      : 'no files loaded';
+    updateFileCount();
     render();
   }
 
@@ -75,7 +73,7 @@
         render();
       });
     }
-    fileCount.textContent = library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device';
+    updateFileCount();
     render();
     if (arr.length) showToast(arr.length + ' file' + (arr.length === 1 ? '' : 's') + ' added');
   }
@@ -90,13 +88,118 @@
     await DB.deleteTrack(id);
     if (track) URL.revokeObjectURL(track.url); // bug fix: avoid leaking blob URLs
     if (currentId === id) { audio.pause(); audio.removeAttribute('src'); currentId = null; isPlaying = false; }
-    fileCount.textContent = library.length
-      ? library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device'
-      : 'no files loaded';
+    updateFileCount();
     render();
   }
 
-  // ---------- Playback ----------
+  function updateFileCount() {
+    fileCount.textContent = library.length
+      ? library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device'
+      : 'no files loaded';
+  }
+
+  // ---------- Export / Import (portable library file) ----------
+  //
+  // File format ("MML1"), all little-endian:
+  //   bytes 0-3    magic "MML1"
+  //   bytes 4-7    uint32 header length in bytes
+  //   header       UTF-8 JSON: { tracks: [{id,title,name,mime,size,duration}], playlists: {...} }
+  //   ...raw audio bytes for each track, back to back, in the order listed in header.tracks
+  //
+  // Raw bytes (not base64) keep the exported file the same size as your
+  // actual mp3s — no ~33% bloat — and it needs no external libraries,
+  // so it works fully offline on both ends.
+
+  async function exportLibrary() {
+    if (!library.length) { showToast('Nothing to export yet'); return; }
+    const meta = {
+      tracks: library.map((t) => ({
+        id: t.id, title: t.title, name: t.name,
+        mime: t.blob.type || 'audio/mpeg', size: t.blob.size, duration: t.duration
+      })),
+      playlists
+    };
+    const headerBytes = new TextEncoder().encode(JSON.stringify(meta));
+    const lenBuf = new Uint8Array(4);
+    new DataView(lenBuf.buffer).setUint32(0, headerBytes.length, true);
+    const magic = new TextEncoder().encode('MML1');
+
+    const blob = new Blob([magic, lenBuf, headerBytes, ...library.map((t) => t.blob)], {
+      type: 'application/octet-stream'
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `mattmusic-library-${stamp}.mmlib`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    showToast('Exported ' + library.length + ' track' + (library.length === 1 ? '' : 's'));
+  }
+
+  async function importLibraryFile(file) {
+    try {
+      const buf = await file.arrayBuffer();
+      if (buf.byteLength < 8) throw new Error('too small');
+      const dv = new DataView(buf);
+      const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 4));
+      if (magic !== 'MML1') { showToast('Not a MattMusic library file'); return; }
+
+      const headerLen = dv.getUint32(4, true);
+      const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, headerLen)));
+      let offset = 8 + headerLen;
+
+      const idMap = {};
+      let added = 0;
+      for (const t of (meta.tracks || [])) {
+        const size = t.size || 0;
+        const slice = buf.slice(offset, offset + size);
+        offset += size;
+
+        const blob = new Blob([slice], { type: t.mime || 'audio/mpeg' });
+        const newId = 'trk_' + Math.random().toString(36).slice(2, 10);
+        idMap[t.id] = newId;
+
+        const url = URL.createObjectURL(blob);
+        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration });
+        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration });
+        added++;
+      }
+
+      let newPlaylists = 0;
+      for (const [name, ids] of Object.entries(meta.playlists || {})) {
+        const mapped = (ids || []).map((id) => idMap[id]).filter(Boolean);
+        if (playlists[name]) {
+          playlists[name] = Array.from(new Set([...playlists[name], ...mapped]));
+        } else {
+          playlists[name] = mapped;
+          newPlaylists++;
+        }
+        await DB.savePlaylist(name, playlists[name]);
+      }
+
+      updateFileCount();
+      render();
+      const bits = [added + ' track' + (added === 1 ? '' : 's')];
+      if (newPlaylists) bits.push(newPlaylists + ' playlist' + (newPlaylists === 1 ? '' : 's'));
+      showToast('Imported ' + bits.join(', '));
+    } catch (err) {
+      console.error('Import failed:', err);
+      showToast('Import failed — file may be corrupted');
+    }
+  }
+
+  function triggerImportPicker() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.mmlib';
+    input.addEventListener('change', (e) => {
+      if (e.target.files[0]) importLibraryFile(e.target.files[0]);
+    });
+    input.click();
+  }
 
   function playTrack(id) {
     const track = getTrackById(id);
@@ -276,7 +379,10 @@
         <div class="empty">
           <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="#6B8F71" stroke-width="1.3"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/><path d="M12 3v3M12 18v3"/></svg>
           <p>Load mp3s from your device to start. They're stored on this device so they're here next time, even offline.</p>
-          <button class="btn btn-primary" id="loadBtn">Choose files</button>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;">
+            <button class="btn btn-primary" id="loadBtn">Choose files</button>
+            <button class="btn btn-ghost" id="importBtnEmpty">Import library file</button>
+          </div>
         </div>`;
     } else if (list.length === 0) {
       listHtml = `<div class="tracklist"><div class="empty-list">No tracks in "${escapeHtml(activeView)}" yet. Add some from your Library.</div></div>`;
@@ -311,8 +417,10 @@
       <div class="tabs">${tabsHtml}</div>
       ${newPlaylistForm}
       <div class="section-label">${activeView === 'library' ? 'Your library' : escapeHtml(activeView)}</div>
-      <div style="margin-bottom:14px;">
-        <button class="btn btn-ghost" id="loadMoreBtn" style="font-size:12px;padding:8px 14px;">+ Add more files</button>
+      <div class="toolbar-row">
+        <button class="btn btn-ghost sm" id="loadMoreBtn">+ Add more files</button>
+        <button class="btn btn-ghost sm" id="exportBtn">↓ Export library</button>
+        <button class="btn btn-ghost sm" id="importBtn">↑ Import library</button>
       </div>
     ` : '';
 
@@ -320,6 +428,9 @@
 
     document.getElementById('loadBtn')?.addEventListener('click', triggerFilePicker);
     document.getElementById('loadMoreBtn')?.addEventListener('click', triggerFilePicker);
+    document.getElementById('exportBtn')?.addEventListener('click', exportLibrary);
+    document.getElementById('importBtn')?.addEventListener('click', triggerImportPicker);
+    document.getElementById('importBtnEmpty')?.addEventListener('click', triggerImportPicker);
     document.getElementById('newPlaylistTab')?.addEventListener('click', () => {
       creatingPlaylist = true; render();
       setTimeout(() => document.getElementById('newPlName')?.focus(), 0);
