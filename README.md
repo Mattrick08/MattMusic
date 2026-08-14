@@ -11,7 +11,7 @@ no server, no upload — your files never leave your browser.
 - **Get free music** — search and download from Internet Archive's open
   audio collections (Creative Commons and public-domain tracks, plus
   live recordings artists have opened up for taping/sharing) — legally,
-  directly into your library
+  directly into your library 
 - **Offline & installable** — a service worker caches the app shell, and
   your files + playlists are stored locally in IndexedDB, so once you've
   loaded a library, MattMusic opens and plays without a network connection
