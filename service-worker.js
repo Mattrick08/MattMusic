@@ -1,7 +1,7 @@
 // MattMusic service worker — caches the app shell so it launches offline.
 // Your mp3 files themselves live in IndexedDB (see db.js), not the cache.
 
-const CACHE_NAME = 'mattmusic-shell-v2';
+const CACHE_NAME = 'mattmusic-shell-v3';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -30,8 +30,11 @@ self.addEventListener('activate', (event) => {
 });
 
 // Cache-first for the app shell; falls back to network for anything else.
+// Cross-origin requests (e.g. searching/downloading from archive.org) are
+// left alone entirely so the service worker never interferes with them.
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
+  if (!event.request.url.startsWith(self.location.origin)) return;
 
   event.respondWith(
     caches.match(event.request).then((cached) => {
