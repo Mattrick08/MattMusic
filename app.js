@@ -59,23 +59,30 @@
       (f) => f.type.startsWith('audio/') || /\.(mp3|m4a|wav|ogg|flac)$/i.test(f.name)
     );
     for (const file of arr) {
-      const id = 'trk_' + Math.random().toString(36).slice(2, 10);
-      const url = URL.createObjectURL(file);
-      const title = file.name.replace(/\.[^/.]+$/, '');
-      const track = { id, name: file.name, blob: file, url, title, duration: null };
-      library.push(track);
-      await DB.addTrack({ id, name: file.name, blob: file, title, duration: null });
-
-      const probe = new Audio(url);
-      probe.addEventListener('loadedmetadata', () => {
-        track.duration = probe.duration;
-        DB.updateTrack({ id, name: file.name, blob: file, title, duration: probe.duration });
-        render();
-      });
+      await ingestBlob(file, file.name);
     }
     updateFileCount();
     render();
     if (arr.length) showToast(arr.length + ' file' + (arr.length === 1 ? '' : 's') + ' added');
+  }
+
+  // Shared by the local file picker, library import, and the free-music
+  // downloader below — takes any audio blob + a filename and stores it.
+  async function ingestBlob(blob, filename) {
+    const id = 'trk_' + Math.random().toString(36).slice(2, 10);
+    const url = URL.createObjectURL(blob);
+    const title = filename.replace(/\.[^/.]+$/, '');
+    const track = { id, name: filename, blob, url, title, duration: null };
+    library.push(track);
+    await DB.addTrack({ id, name: filename, blob, title, duration: null });
+
+    const probe = new Audio(url);
+    probe.addEventListener('loadedmetadata', () => {
+      track.duration = probe.duration;
+      DB.updateTrack({ id, name: filename, blob, title, duration: probe.duration });
+      render();
+    });
+    return track;
   }
 
   async function removeTrack(id) {
@@ -199,6 +206,237 @@
       if (e.target.files[0]) importLibraryFile(e.target.files[0]);
     });
     input.click();
+  }
+
+  // ---------- Discover: free, legally-downloadable music (Internet Archive) ----------
+  //
+  // Searches archive.org's public Advanced Search API, scoped to audio that's
+  // either explicitly licensed (licenseurl set — usually Creative Commons) or
+  // in collections the Archive publishes specifically for free reuse
+  // (netlabels, and the Live Music Archive for bands that allow taping/sharing).
+  // No API key, no server of ours involved — this talks to archive.org directly
+  // from your browser, so it needs an internet connection.
+
+  const IA_SEARCH = 'https://archive.org/advancedsearch.php';
+  const IA_METADATA = 'https://archive.org/metadata/';
+  const IA_DOWNLOAD = 'https://archive.org/download/';
+  const IA_THUMB = 'https://archive.org/services/img/';
+
+  let discoverOpen = false;
+  let discoverQuery = '';
+  let discoverLoading = false;
+  let discoverError = '';
+  let discoverResults = [];      // [{identifier, title, creator, licenseurl}]
+  let discoverItem = null;        // identifier of item whose files are shown, or null
+  let discoverItemTitle = '';
+  let discoverFiles = [];         // [{name, title, size}]
+  let discoverFilesLoading = false;
+  let downloadingKeys = new Set(); // file identifiers currently downloading
+
+  function licenseLabel(url) {
+    if (!url) return null;
+    if (/publicdomain/i.test(url)) return 'Public domain';
+    const m = url.match(/creativecommons\.org\/(licenses|publicdomain)\/([a-z-]+)\/?([\d.]+)?/i);
+    if (m) {
+      if (m[1] === 'publicdomain') return 'Public domain';
+      return 'CC ' + m[2].toUpperCase() + (m[3] ? ' ' + m[3] : '');
+    }
+    return 'See license';
+  }
+
+  async function searchArchive(query) {
+    discoverQuery = query;
+    discoverLoading = true;
+    discoverError = '';
+    discoverResults = [];
+    discoverItem = null;
+    renderDiscover();
+
+    try {
+      const q = `(${query.replace(/"/g, '')}) AND mediatype:(audio) AND (collection:(netlabels) OR collection:(etree) OR licenseurl:*)`;
+      const params = new URLSearchParams({
+        q,
+        'fl[]': 'identifier,title,creator,licenseurl',
+        rows: '24',
+        output: 'json'
+      });
+      const res = await fetch(IA_SEARCH + '?' + params.toString());
+      if (!res.ok) throw new Error('search failed: ' + res.status);
+      const data = await res.json();
+      discoverResults = (data.response && data.response.docs) || [];
+    } catch (err) {
+      console.error('Archive search failed:', err);
+      discoverError = navigator.onLine === false
+        ? "You're offline — free-music search needs a connection."
+        : 'Search failed. Try again in a moment.';
+    } finally {
+      discoverLoading = false;
+      renderDiscover();
+    }
+  }
+
+  async function openDiscoverItem(identifier, title) {
+    discoverItem = identifier;
+    discoverItemTitle = title;
+    discoverFiles = [];
+    discoverFilesLoading = true;
+    discoverError = '';
+    renderDiscover();
+
+    try {
+      const res = await fetch(IA_METADATA + encodeURIComponent(identifier));
+      if (!res.ok) throw new Error('metadata failed: ' + res.status);
+      const data = await res.json();
+      discoverFiles = (data.files || [])
+        .filter((f) => /mp3/i.test(f.format || '') || /\.mp3$/i.test(f.name || ''))
+        .map((f) => ({
+          name: f.name,
+          title: (f.title || f.name.replace(/\.[^/.]+$/, '')),
+          size: f.size ? Number(f.size) : null
+        }));
+      if (!discoverFiles.length) discoverError = 'No mp3 files found for this item.';
+    } catch (err) {
+      console.error('Archive metadata failed:', err);
+      discoverError = navigator.onLine === false
+        ? "You're offline — free-music search needs a connection."
+        : 'Could not load this item. Try again.';
+    } finally {
+      discoverFilesLoading = false;
+      renderDiscover();
+    }
+  }
+
+  async function downloadArchiveFile(file) {
+    const key = discoverItem + '/' + file.name;
+    if (downloadingKeys.has(key)) return;
+    downloadingKeys.add(key);
+    renderDiscover();
+
+    try {
+      const url = IA_DOWNLOAD + encodeURIComponent(discoverItem) + '/' + encodeURIComponent(file.name);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('download failed: ' + res.status);
+      const blob = await res.blob();
+      const filename = /\.mp3$/i.test(file.name) ? file.name : file.title + '.mp3';
+      await ingestBlob(blob, filename);
+      updateFileCount();
+      showToast('Added "' + file.title + '" to your library');
+    } catch (err) {
+      console.error('Archive download failed:', err);
+      showToast('Download failed — try again');
+    } finally {
+      downloadingKeys.delete(key);
+      renderDiscover();
+      render();
+    }
+  }
+
+  function openDiscover() {
+    discoverOpen = true;
+    discoverQuery = '';
+    discoverResults = [];
+    discoverItem = null;
+    discoverError = '';
+    renderDiscover();
+    setTimeout(() => document.getElementById('discoverSearchInput')?.focus(), 30);
+  }
+
+  function closeDiscover() {
+    discoverOpen = false;
+    renderDiscover();
+  }
+
+  function fmtSize(bytes) {
+    if (!bytes) return '';
+    const mb = bytes / (1024 * 1024);
+    return mb >= 1 ? mb.toFixed(1) + ' MB' : Math.round(bytes / 1024) + ' KB';
+  }
+
+  let discoverEl = null;
+  function renderDiscover() {
+    if (!discoverEl) {
+      discoverEl = document.createElement('div');
+      discoverEl.className = 'discover-overlay';
+      document.body.appendChild(discoverEl);
+    }
+    if (!discoverOpen) { discoverEl.style.display = 'none'; discoverEl.innerHTML = ''; return; }
+    discoverEl.style.display = 'flex';
+
+    let body;
+    if (discoverItem) {
+      // File list view for one item
+      body = `
+        <div class="discover-backrow">
+          <button class="icon-btn" id="discoverBack" title="Back to results">←</button>
+          <div class="discover-item-title">${escapeHtml(discoverItemTitle)}</div>
+        </div>
+        ${discoverFilesLoading ? '<div class="discover-status">Loading tracks…</div>' : ''}
+        ${discoverError ? `<div class="discover-status error">${escapeHtml(discoverError)}</div>` : ''}
+        ${discoverFiles.length ? `<div class="tracklist">` + discoverFiles.map((f) => {
+          const key = discoverItem + '/' + f.name;
+          const busy = downloadingKeys.has(key);
+          return `<div class="track">
+            <span class="mono" style="background:${monoColor(f.title)}">${monoLetter(f.title)}</span>
+            <div class="meta"><div class="title">${escapeHtml(f.title)}</div></div>
+            <span class="dur">${fmtSize(f.size)}</span>
+            <button class="icon-btn" data-dl="${encodeURIComponent(f.name)}" ${busy ? 'disabled' : ''} title="Add to library">${busy ? '…' : '⬇'}</button>
+          </div>`;
+        }).join('') + `</div>` : ''}
+      `;
+    } else {
+      // Search + results grid
+      body = `
+        <form id="discoverSearchForm" class="discover-search-row">
+          <input id="discoverSearchInput" placeholder="Search free & Creative Commons music…" value="${escapeHtml(discoverQuery)}" />
+          <button class="btn btn-primary sm" type="submit">Search</button>
+        </form>
+        <p class="discover-hint">From Internet Archive's open audio collections — public domain, Creative Commons, and live recordings artists allow sharing. Always shown with its license.</p>
+        ${discoverLoading ? '<div class="discover-status">Searching…</div>' : ''}
+        ${discoverError ? `<div class="discover-status error">${escapeHtml(discoverError)}</div>` : ''}
+        ${(!discoverLoading && discoverQuery && !discoverError && discoverResults.length === 0) ? '<div class="discover-status">No results. Try a different search.</div>' : ''}
+        <div class="discover-grid">
+          ${discoverResults.map((r) => {
+            const lic = licenseLabel(r.licenseurl);
+            return `<div class="discover-card" data-open="${escapeHtml(r.identifier)}" data-title="${escapeHtml(r.title || r.identifier)}">
+              <img class="discover-thumb" src="${IA_THUMB}${encodeURIComponent(r.identifier)}" loading="lazy" onerror="this.style.opacity=0" />
+              <div class="discover-card-title">${escapeHtml(r.title || r.identifier)}</div>
+              ${r.creator ? `<div class="discover-card-sub">${escapeHtml(Array.isArray(r.creator) ? r.creator[0] : r.creator)}</div>` : ''}
+              ${lic ? `<span class="discover-badge">${escapeHtml(lic)}</span>` : ''}
+            </div>`;
+          }).join('')}
+        </div>
+      `;
+    }
+
+    discoverEl.innerHTML = `
+      <div class="discover-panel">
+        <div class="discover-header">
+          <span class="discover-heading">Get free music</span>
+          <button class="icon-btn" id="discoverClose" title="Close">✕</button>
+        </div>
+        <div class="discover-body">${body}</div>
+      </div>
+    `;
+
+    document.getElementById('discoverClose')?.addEventListener('click', closeDiscover);
+    document.getElementById('discoverBack')?.addEventListener('click', () => {
+      discoverItem = null; discoverError = ''; renderDiscover();
+    });
+    document.getElementById('discoverSearchForm')?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const val = document.getElementById('discoverSearchInput').value.trim();
+      if (val) searchArchive(val);
+    });
+    discoverEl.querySelectorAll('[data-open]').forEach((el) => {
+      el.addEventListener('click', () => openDiscoverItem(el.dataset.open, el.dataset.title));
+    });
+    discoverEl.querySelectorAll('[data-dl]').forEach((el) => {
+      el.addEventListener('click', () => {
+        const name = decodeURIComponent(el.dataset.dl);
+        const file = discoverFiles.find((f) => f.name === name);
+        if (file) downloadArchiveFile(file);
+      });
+    });
   }
 
   function playTrack(id) {
@@ -381,6 +619,7 @@
           <p>Load mp3s from your device to start. They're stored on this device so they're here next time, even offline.</p>
           <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;">
             <button class="btn btn-primary" id="loadBtn">Choose files</button>
+            <button class="btn btn-ghost" id="discoverBtnEmpty">Get free music</button>
             <button class="btn btn-ghost" id="importBtnEmpty">Import library file</button>
           </div>
         </div>`;
@@ -419,6 +658,7 @@
       <div class="section-label">${activeView === 'library' ? 'Your library' : escapeHtml(activeView)}</div>
       <div class="toolbar-row">
         <button class="btn btn-ghost sm" id="loadMoreBtn">+ Add more files</button>
+        <button class="btn btn-ghost sm" id="discoverBtn">♫ Get free music</button>
         <button class="btn btn-ghost sm" id="exportBtn">↓ Export library</button>
         <button class="btn btn-ghost sm" id="importBtn">↑ Import library</button>
       </div>
@@ -428,6 +668,8 @@
 
     document.getElementById('loadBtn')?.addEventListener('click', triggerFilePicker);
     document.getElementById('loadMoreBtn')?.addEventListener('click', triggerFilePicker);
+    document.getElementById('discoverBtn')?.addEventListener('click', openDiscover);
+    document.getElementById('discoverBtnEmpty')?.addEventListener('click', openDiscover);
     document.getElementById('exportBtn')?.addEventListener('click', exportLibrary);
     document.getElementById('importBtn')?.addEventListener('click', triggerImportPicker);
     document.getElementById('importBtnEmpty')?.addEventListener('click', triggerImportPicker);
