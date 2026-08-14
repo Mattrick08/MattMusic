@@ -100,6 +100,19 @@
     if (track) showToast('Deleted "' + track.title + '"');
   }
 
+  async function renameTrack(id) {
+    const track = getTrackById(id);
+    if (!track) return;
+    const next = prompt('Rename track', track.title);
+    if (next == null) return; // cancelled
+    const title = next.trim();
+    if (!title || title === track.title) return;
+    track.title = title;
+    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title, duration: track.duration });
+    render();
+    showToast('Renamed to "' + title + '"');
+  }
+
   function updateFileCount() {
     fileCount.textContent = library.length
       ? library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device'
@@ -402,9 +415,9 @@
           const addBtn = Object.keys(playlists).length
             ? `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`
             : '';
-          actionBtn = addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
+          actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
         } else {
-          actionBtn = `<button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
+          actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button><button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
         }
         const eq = (isPl && isPlaying) ? '<span class="eq"><span></span><span></span><span></span></span>' : '';
         return `<div class="track ${isPl ? 'playing' : ''}" data-play="${t.id}">
@@ -462,7 +475,7 @@
     });
     content.querySelectorAll('[data-play]').forEach((el) => {
       el.addEventListener('click', (e) => {
-        if (e.target.closest('[data-add],[data-remove-from],[data-delete]')) return;
+        if (e.target.closest('[data-add],[data-remove-from],[data-delete],[data-rename]')) return;
         playTrack(el.dataset.play);
       });
     });
@@ -471,6 +484,9 @@
     });
     content.querySelectorAll('[data-remove-from]').forEach((el) => {
       el.addEventListener('click', (e) => { e.stopPropagation(); removeFromPlaylist(el.dataset.removeFrom, activeView); });
+    });
+    content.querySelectorAll('[data-rename]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); renameTrack(el.dataset.rename); });
     });
     content.querySelectorAll('[data-delete]').forEach((el) => {
       el.addEventListener('click', (e) => {
