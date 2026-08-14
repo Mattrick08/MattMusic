@@ -1,0 +1,445 @@
+(function () {
+  const audio = document.getElementById('audio');
+  const content = document.getElementById('content');
+  const fileCount = document.getElementById('fileCount');
+  const toastEl = document.getElementById('toast');
+
+  // State
+  let library = [];          // {id, name, blob, url, title, duration}
+  let playlists = {};         // name -> array of track ids
+  let activeView = 'library'; // 'library' or playlist name
+  let currentId = null;
+  let isPlaying = false;
+  let shuffle = false;
+  let repeatMode = 'off';     // off | all | one
+  let shuffleOrder = [];
+  let creatingPlaylist = false;
+
+  function fmtTime(s) {
+    if (!isFinite(s) || s == null) return '0:00';
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60).toString().padStart(2, '0');
+    return m + ':' + sec;
+  }
+
+  function showToast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => toastEl.classList.remove('show'), 1800);
+  }
+
+  function currentList() {
+    if (activeView === 'library') return library;
+    const ids = playlists[activeView] || [];
+    return ids.map((id) => library.find((t) => t.id === id)).filter(Boolean);
+  }
+
+  function getTrackById(id) {
+    return library.find((t) => t.id === id);
+  }
+
+  // ---------- Loading & persistence ----------
+
+  async function bootstrap() {
+    const stored = await DB.getAllTracks();
+    stored.forEach((t) => {
+      t.url = URL.createObjectURL(t.blob);
+      library.push(t);
+    });
+    const storedPlaylists = await DB.getAllPlaylists();
+    storedPlaylists.forEach((p) => { playlists[p.name] = p.trackIds; });
+
+    fileCount.textContent = library.length
+      ? library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device'
+      : 'no files loaded';
+    render();
+  }
+
+  async function loadFiles(fileList) {
+    const arr = Array.from(fileList).filter(
+      (f) => f.type.startsWith('audio/') || /\.(mp3|m4a|wav|ogg|flac)$/i.test(f.name)
+    );
+    for (const file of arr) {
+      const id = 'trk_' + Math.random().toString(36).slice(2, 10);
+      const url = URL.createObjectURL(file);
+      const title = file.name.replace(/\.[^/.]+$/, '');
+      const track = { id, name: file.name, blob: file, url, title, duration: null };
+      library.push(track);
+      await DB.addTrack({ id, name: file.name, blob: file, title, duration: null });
+
+      const probe = new Audio(url);
+      probe.addEventListener('loadedmetadata', () => {
+        track.duration = probe.duration;
+        DB.updateTrack({ id, name: file.name, blob: file, title, duration: probe.duration });
+        render();
+      });
+    }
+    fileCount.textContent = library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device';
+    render();
+    if (arr.length) showToast(arr.length + ' file' + (arr.length === 1 ? '' : 's') + ' added');
+  }
+
+  async function removeTrack(id) {
+    const track = getTrackById(id);
+    library = library.filter((t) => t.id !== id);
+    Object.keys(playlists).forEach((name) => {
+      playlists[name] = playlists[name].filter((tid) => tid !== id);
+      DB.savePlaylist(name, playlists[name]);
+    });
+    await DB.deleteTrack(id);
+    if (track) URL.revokeObjectURL(track.url); // bug fix: avoid leaking blob URLs
+    if (currentId === id) { audio.pause(); audio.removeAttribute('src'); currentId = null; isPlaying = false; }
+    fileCount.textContent = library.length
+      ? library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device'
+      : 'no files loaded';
+    render();
+  }
+
+  // ---------- Playback ----------
+
+  function playTrack(id) {
+    const track = getTrackById(id);
+    if (!track) return;
+    currentId = id;
+    audio.src = track.url;
+    audio.play().then(() => { isPlaying = true; render(); }).catch(() => { isPlaying = false; render(); });
+    updateMediaSession(track);
+    render();
+  }
+
+  function togglePlay() {
+    if (!currentId) {
+      const list = currentList();
+      if (list.length) playTrack(list[0].id);
+      return;
+    }
+    if (isPlaying) { audio.pause(); isPlaying = false; }
+    else { audio.play(); isPlaying = true; }
+    render();
+  }
+
+  function buildShuffleOrder() {
+    const list = currentList().map((t) => t.id);
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    shuffleOrder = list;
+  }
+
+  function nextTrack(auto) {
+    const list = currentList();
+    if (!list.length) return;
+    let order = shuffle ? shuffleOrder : list.map((t) => t.id);
+    if (shuffle && (!order.length || !order.includes(currentId))) { buildShuffleOrder(); order = shuffleOrder; }
+    let idx = order.indexOf(currentId);
+    if (repeatMode === 'one' && auto) { playTrack(currentId); return; }
+    idx = (idx + 1) % order.length;
+    if (idx === 0 && auto && repeatMode !== 'all' && !shuffle) {
+      isPlaying = false; render(); return;
+    }
+    playTrack(order[idx]);
+  }
+
+  function prevTrack() {
+    const list = currentList();
+    if (!list.length) return;
+    let order = shuffle ? shuffleOrder : list.map((t) => t.id);
+    let idx = order.indexOf(currentId);
+    idx = (idx - 1 + order.length) % order.length;
+    playTrack(order[idx]);
+  }
+
+  function toggleShuffle() {
+    shuffle = !shuffle;
+    if (shuffle) buildShuffleOrder();
+    render();
+  }
+
+  function cycleRepeat() {
+    repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off';
+    render();
+  }
+
+  // ---------- Playlists ----------
+
+  function createPlaylist(name) {
+    name = name.trim();
+    if (!name || playlists[name]) return;
+    playlists[name] = [];
+    DB.savePlaylist(name, []);
+    activeView = name;
+    creatingPlaylist = false;
+    render();
+    showToast('Playlist "' + name + '" created');
+  }
+
+  function deletePlaylist(name) {
+    if (!confirm('Delete playlist "' + name + '"? Tracks stay in your library.')) return;
+    delete playlists[name];
+    DB.deletePlaylist(name);
+    if (activeView === name) activeView = 'library';
+    render();
+  }
+
+  function addToPlaylist(trackId, plName) {
+    if (!playlists[plName].includes(trackId)) {
+      playlists[plName].push(trackId);
+      DB.savePlaylist(plName, playlists[plName]);
+      showToast('Added to ' + plName);
+    }
+    render();
+  }
+
+  function removeFromPlaylist(trackId, plName) {
+    playlists[plName] = playlists[plName].filter((id) => id !== trackId);
+    DB.savePlaylist(plName, playlists[plName]);
+    render();
+  }
+
+  // ---------- Media Session (lock screen controls) ----------
+
+  function updateMediaSession(track) {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: track.title,
+        artist: 'Your library',
+        album: activeView === 'library' ? 'Library' : activeView
+      });
+      navigator.mediaSession.setActionHandler('play', () => { audio.play(); isPlaying = true; render(); });
+      navigator.mediaSession.setActionHandler('pause', () => { audio.pause(); isPlaying = false; render(); });
+      navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
+      navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack(false));
+    }
+  }
+
+  audio.addEventListener('ended', () => nextTrack(true));
+  audio.addEventListener('timeupdate', renderProgressOnly);
+  audio.addEventListener('play', () => { isPlaying = true; renderControlsOnly(); });
+  audio.addEventListener('pause', () => { isPlaying = false; renderControlsOnly(); });
+
+  function renderProgressOnly() {
+    const bar = document.getElementById('seek');
+    const cur = document.getElementById('curTime');
+    if (bar && !bar.dragging) bar.value = audio.currentTime || 0;
+    if (cur) cur.textContent = fmtTime(audio.currentTime);
+  }
+  function renderControlsOnly() {
+    const playBtn = document.getElementById('playBtnIcon');
+    if (playBtn) playBtn.innerHTML = isPlaying ? iconPause() : iconPlay();
+    syncBrandMark();
+  }
+
+  function syncBrandMark() {
+    const mark = document.getElementById('brandMark');
+    if (!mark) return;
+    mark.classList.toggle('spinning', isPlaying);
+  }
+
+  function iconPlay() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'; }
+  function iconPause() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>'; }
+
+  // ---------- Rendering ----------
+
+  function escapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // A few warm tints drawn from the palette, rotated by a hash of the
+  // title so each track gets a stable, distinct monogram color.
+  const MONO_COLORS = ['#E8A33D', '#6B8F71', '#C97B4A', '#7FA8A0', '#D9B15C'];
+  function monoColor(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+    return MONO_COLORS[h % MONO_COLORS.length];
+  }
+  function monoLetter(title) {
+    const m = title.trim().match(/[a-zA-Z0-9]/);
+    return m ? m[0].toUpperCase() : '♪';
+  }
+
+  function render() {
+    const tabsHtml = ['library', ...Object.keys(playlists)].map((name) => {
+      const label = name === 'library' ? 'Library' : escapeHtml(name);
+      const del = name !== 'library' ? `<span class="del" data-del-playlist="${escapeHtml(name)}">✕</span>` : '';
+      return `<div class="tab ${activeView === name ? 'active' : ''}" data-view="${escapeHtml(name)}">${label}${del}</div>`;
+    }).join('') + `<div class="tab new" id="newPlaylistTab">+ New playlist</div>`;
+
+    const list = currentList();
+
+    let listHtml;
+    if (library.length === 0) {
+      listHtml = `
+        <div class="empty">
+          <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="#6B8F71" stroke-width="1.3"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/><path d="M12 3v3M12 18v3"/></svg>
+          <p>Load mp3s from your device to start. They're stored on this device so they're here next time, even offline.</p>
+          <button class="btn btn-primary" id="loadBtn">Choose files</button>
+        </div>`;
+    } else if (list.length === 0) {
+      listHtml = `<div class="tracklist"><div class="empty-list">No tracks in "${escapeHtml(activeView)}" yet. Add some from your Library.</div></div>`;
+    } else {
+      listHtml = `<div class="tracklist">` + list.map((t, i) => {
+        const isPl = t.id === currentId;
+        let actionBtn = '';
+        if (activeView === 'library') {
+          if (Object.keys(playlists).length) {
+            actionBtn = `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`;
+          }
+        } else {
+          actionBtn = `<button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
+        }
+        const eq = (isPl && isPlaying) ? '<span class="eq"><span></span><span></span><span></span></span>' : '';
+        return `<div class="track ${isPl ? 'playing' : ''}" data-play="${t.id}">
+          <span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>
+          <div class="meta"><div class="title">${eq}${escapeHtml(t.title)}</div></div>
+          <span class="dur">${t.duration ? fmtTime(t.duration) : '--:--'}</span>
+          ${actionBtn}
+        </div>`;
+      }).join('') + `</div>`;
+    }
+
+    const newPlaylistForm = creatingPlaylist ? `
+      <div class="new-playlist-form">
+        <input id="newPlName" placeholder="Playlist name" autofocus />
+        <button class="btn btn-primary" id="confirmNewPl">Create</button>
+      </div>` : '';
+
+    const header = library.length ? `
+      <div class="tabs">${tabsHtml}</div>
+      ${newPlaylistForm}
+      <div class="section-label">${activeView === 'library' ? 'Your library' : escapeHtml(activeView)}</div>
+      <div style="margin-bottom:14px;">
+        <button class="btn btn-ghost" id="loadMoreBtn" style="font-size:12px;padding:8px 14px;">+ Add more files</button>
+      </div>
+    ` : '';
+
+    content.innerHTML = header + listHtml;
+
+    document.getElementById('loadBtn')?.addEventListener('click', triggerFilePicker);
+    document.getElementById('loadMoreBtn')?.addEventListener('click', triggerFilePicker);
+    document.getElementById('newPlaylistTab')?.addEventListener('click', () => {
+      creatingPlaylist = true; render();
+      setTimeout(() => document.getElementById('newPlName')?.focus(), 0);
+    });
+    document.getElementById('confirmNewPl')?.addEventListener('click', () => {
+      createPlaylist(document.getElementById('newPlName').value);
+    });
+    document.getElementById('newPlName')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') createPlaylist(e.target.value);
+    });
+
+    content.querySelectorAll('[data-view]').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        if (e.target.closest('[data-del-playlist]')) return;
+        activeView = el.dataset.view; creatingPlaylist = false; render();
+      });
+    });
+    content.querySelectorAll('[data-del-playlist]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); deletePlaylist(el.dataset.delPlaylist); });
+    });
+    content.querySelectorAll('[data-play]').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        if (e.target.closest('[data-add],[data-remove-from]')) return;
+        playTrack(el.dataset.play);
+      });
+    });
+    content.querySelectorAll('[data-add]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); showAddMenu(el.dataset.add); });
+    });
+    content.querySelectorAll('[data-remove-from]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); removeFromPlaylist(el.dataset.removeFrom, activeView); });
+    });
+
+    renderNowPlaying();
+    syncBrandMark();
+  }
+
+  function showAddMenu(trackId) {
+    const names = Object.keys(playlists);
+    if (!names.length) return;
+    const choice = names.length === 1 ? names[0] : prompt('Add to which playlist?\n' + names.join(', '));
+    if (choice && playlists[choice]) addToPlaylist(trackId, choice);
+  }
+
+  function triggerFilePicker() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.accept = 'audio/*';
+    input.addEventListener('change', (e) => loadFiles(e.target.files));
+    input.click();
+  }
+
+  let npEl = null;
+  function renderNowPlaying() {
+    const track = currentId ? getTrackById(currentId) : null;
+    if (!npEl) {
+      npEl = document.createElement('div');
+      npEl.className = 'now-playing';
+      document.body.appendChild(npEl);
+    }
+    if (!track) { npEl.style.display = 'none'; return; }
+    npEl.style.display = 'block';
+
+    npEl.innerHTML = `
+      <div class="np-inner">
+        <div class="np-track">${escapeHtml(track.title)}</div>
+        <div class="np-progress">
+          <span class="np-time" id="curTime">${fmtTime(audio.currentTime)}</span>
+          <input type="range" id="seek" min="0" max="${track.duration || 0}" value="${audio.currentTime || 0}" step="0.1"/>
+          <span class="np-time end">${track.duration ? fmtTime(track.duration) : '--:--'}</span>
+        </div>
+        <div class="np-controls">
+          <button class="toggle ${shuffle ? 'on' : ''}" id="shuffleBtn" title="Shuffle">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4h4l7 16h5M4 20h4l3.5-8M17 4h4v4M17 20h4v-4"/></svg>
+          </button>
+          <button id="prevBtn"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zM20 6L10 12l10 6z"/></svg></button>
+          <button class="play-btn" id="playBtn"><span id="playBtnIcon">${isPlaying ? iconPause() : iconPlay()}</span></button>
+          <button id="nextBtn"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 6h2v12h-2zM4 6l10 6L4 18z"/></svg></button>
+          <button class="toggle ${repeatMode !== 'off' ? 'on' : ''}" id="repeatBtn" title="Repeat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 2l4 4-4 4M3 11V9a4 4 0 014-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 01-4 4H3"/>${repeatMode === 'one' ? '<text x="9" y="15.5" font-size="7" fill="currentColor" stroke="none">1</text>' : ''}</svg>
+          </button>
+        </div>
+      </div>`;
+
+    const seek = document.getElementById('seek');
+    seek.addEventListener('input', () => { seek.dragging = true; document.getElementById('curTime').textContent = fmtTime(seek.value); });
+    seek.addEventListener('change', () => { audio.currentTime = parseFloat(seek.value); seek.dragging = false; });
+
+    document.getElementById('playBtn').addEventListener('click', togglePlay);
+    document.getElementById('prevBtn').addEventListener('click', prevTrack);
+    document.getElementById('nextBtn').addEventListener('click', () => nextTrack(false));
+    document.getElementById('shuffleBtn').addEventListener('click', toggleShuffle);
+    document.getElementById('repeatBtn').addEventListener('click', cycleRepeat);
+  }
+
+  // ---------- Install prompt ----------
+
+  let deferredInstallPrompt = null;
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    const btn = document.getElementById('installBtn');
+    if (btn) btn.style.display = 'inline-block';
+  });
+  document.getElementById('installBtn')?.addEventListener('click', async () => {
+    if (!deferredInstallPrompt) return;
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    document.getElementById('installBtn').style.display = 'none';
+  });
+
+  // ---------- Service worker ----------
+
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./service-worker.js').catch(() => {});
+    });
+  }
+
+  bootstrap();
+})();

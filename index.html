@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>MattMusic — your own mp3s</title>
+<meta name="description" content="A personal music player for the mp3s already on your device.">
+<meta name="theme-color" content="#16221F">
+
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MattMusic">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app" id="app">
+  <header>
+    <div class="brand">
+      <svg class="brand-mark" id="brandMark" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="20" cy="20" r="18" fill="var(--bg)" stroke="var(--amber)" stroke-width="1.6"/>
+        <circle cx="20" cy="20" r="13.5" stroke="var(--sage)" stroke-width="1.1" opacity="0.8"/>
+        <circle cx="20" cy="20" r="9" stroke="var(--sage)" stroke-width="1.1" opacity="0.6"/>
+        <circle cx="20" cy="20" r="6.5" fill="var(--cream)"/>
+        <circle cx="20" cy="20" r="1.6" fill="var(--bg)"/>
+      </svg>
+      <div>
+        <h1>MattMusic</h1>
+        <span class="tagline">your library, offline</span>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span class="tag" id="fileCount">no files loaded</span>
+      <button class="btn btn-ghost" id="installBtn" style="display:none;font-size:11px;padding:6px 12px;">Install</button>
+    </div>
+  </header>
+
+  <div id="content"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+<audio id="audio"></audio>
+
+<script src="db.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
