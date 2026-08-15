@@ -18,6 +18,8 @@
   let sortMode = 'added';     // 'added' | 'alpha' | 'duration'
   let selectMode = false;
   let selectedIds = new Set();
+  let queue = [];              // array of track ids, front of array plays next
+  let queuePanelOpen = false;
 
   function fmtTime(s) {
     if (!isFinite(s) || s == null) return '0:00';
@@ -220,6 +222,7 @@
       playlists[name] = playlists[name].filter((tid) => !idSet.has(tid));
       if (playlists[name].length !== before) DB.savePlaylist(name, playlists[name]);
     });
+    queue = queue.filter((tid) => !idSet.has(tid));
     for (const id of ids) {
       await DB.deleteTrack(id);
       selectedIds.delete(id);
@@ -392,12 +395,18 @@
   }
 
   function nextTrack(auto) {
+    if (repeatMode === 'one' && auto) { playTrack(currentId); return; }
+    if (queue.length) {
+      const id = queue.shift();
+      if (!getTrackById(id)) { render(); nextTrack(auto); return; } // stale id (deleted track) — skip it
+      playTrack(id);
+      return;
+    }
     const list = currentList();
     if (!list.length) return;
     let order = shuffle ? shuffleOrder : list.map((t) => t.id);
     if (shuffle && (!order.length || !order.includes(currentId))) { buildShuffleOrder(); order = shuffleOrder; }
     let idx = order.indexOf(currentId);
-    if (repeatMode === 'one' && auto) { playTrack(currentId); return; }
     idx = (idx + 1) % order.length;
     if (idx === 0 && auto && repeatMode !== 'all' && !shuffle) {
       isPlaying = false; render(); return;
@@ -422,6 +431,37 @@
 
   function cycleRepeat() {
     repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off';
+    render();
+  }
+
+  // ---------- Queue (up next) ----------
+
+  function addToQueue(id) {
+    if (!getTrackById(id)) return;
+    queue.push(id);
+    render();
+    showToast('Added to queue');
+  }
+
+  function removeFromQueue(index) {
+    queue.splice(index, 1);
+    render();
+  }
+
+  function moveQueueItem(index, dir) {
+    const target = index + dir;
+    if (target < 0 || target >= queue.length) return;
+    [queue[index], queue[target]] = [queue[target], queue[index]];
+    render();
+  }
+
+  function clearQueue() {
+    queue = [];
+    render();
+  }
+
+  function toggleQueuePanel() {
+    queuePanelOpen = !queuePanelOpen;
     render();
   }
 
@@ -645,13 +685,14 @@
         const isSel = selectedIds.has(t.id);
         let actionBtn = '';
         if (!selectMode) {
+          const queueBtn = `<button class="icon-btn" data-queue-add="${t.id}" title="Add to queue">Q+</button>`;
           if (activeView === 'library') {
             const addBtn = Object.keys(playlists).length
               ? `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`
               : '';
-            actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
+            actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + queueBtn + addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
           } else {
-            actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button><button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
+            actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + queueBtn + `<button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
           }
         }
         const eq = (isPl && isPlaying) ? '<span class="eq"><span></span><span></span><span></span></span>' : '';
@@ -767,7 +808,7 @@
     });
     content.querySelectorAll('[data-play]').forEach((el) => {
       el.addEventListener('click', (e) => {
-        if (e.target.closest('[data-add],[data-remove-from],[data-delete],[data-rename]')) return;
+        if (e.target.closest('[data-add],[data-remove-from],[data-delete],[data-rename],[data-queue-add]')) return;
         if (selectMode) { toggleSelect(el.dataset.play); return; }
         playTrack(el.dataset.play);
       });
@@ -780,6 +821,9 @@
     });
     content.querySelectorAll('[data-rename]').forEach((el) => {
       el.addEventListener('click', (e) => { e.stopPropagation(); renameTrack(el.dataset.rename); });
+    });
+    content.querySelectorAll('[data-queue-add]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); addToQueue(el.dataset.queueAdd); });
     });
     content.querySelectorAll('[data-delete]').forEach((el) => {
       el.addEventListener('click', (e) => {
@@ -798,6 +842,7 @@
     }
 
     renderNowPlaying();
+    renderQueuePanel();
     syncBrandMark();
   }
 
@@ -844,6 +889,10 @@
             ? `<img class="np-art" src="${track.artUrl}" alt="" />`
             : `<span class="np-art np-art-mono" style="background:${monoColor(track.title)}">${monoLetter(track.title)}</span>`}
           <div class="np-track">${escapeHtml(track.title)}</div>
+          <button class="np-queue-btn" id="queueToggleBtn" title="Up next">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h11"/></svg>
+            ${queue.length ? `<span class="queue-badge">${queue.length}</span>` : ''}
+          </button>
         </div>
         <div class="np-progress">
           <span class="np-time" id="curTime">${fmtTime(audio.currentTime)}</span>
@@ -872,6 +921,74 @@
     document.getElementById('nextBtn').addEventListener('click', () => nextTrack(false));
     document.getElementById('shuffleBtn').addEventListener('click', toggleShuffle);
     document.getElementById('repeatBtn').addEventListener('click', cycleRepeat);
+    document.getElementById('queueToggleBtn').addEventListener('click', toggleQueuePanel);
+  }
+
+  // ---------- Queue panel (up next) ----------
+
+  let queueEl = null;
+  function renderQueuePanel() {
+    if (!queueEl) {
+      queueEl = document.createElement('div');
+      document.body.appendChild(queueEl);
+    }
+    if (!queuePanelOpen) { queueEl.innerHTML = ''; return; }
+
+    const items = queue.map((id) => getTrackById(id)).filter(Boolean);
+    const nowTrack = currentId ? getTrackById(currentId) : null;
+
+    const rows = items.length ? items.map((t, i) => `
+      <div class="queue-item">
+        <span class="queue-pos">${i + 1}</span>
+        ${t.artUrl
+          ? `<img class="art-thumb" src="${t.artUrl}" alt="" />`
+          : `<span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>`}
+        <div class="meta"><div class="title">${escapeHtml(t.title)}</div></div>
+        <span class="dur">${t.duration ? fmtTime(t.duration) : '--:--'}</span>
+        <button class="icon-btn" data-queue-up="${i}" title="Move up" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="icon-btn" data-queue-down="${i}" title="Move down" ${i === items.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="icon-btn" data-queue-remove="${i}" title="Remove from queue">✕</button>
+      </div>`).join('')
+      : `<div class="empty-list">Nothing queued yet. Tap "Q+" next to a track to add it here.</div>`;
+
+    queueEl.innerHTML = `
+      <div class="queue-overlay" id="queueOverlay">
+        <div class="queue-sheet">
+          <div class="queue-sheet-header">
+            <div class="section-label" style="margin:0;">Up next${items.length ? ' · ' + items.length : ''}</div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              ${items.length ? `<button class="btn btn-ghost sm" id="clearQueueBtn">Clear</button>` : ''}
+              <button class="icon-btn" id="closeQueueBtn" title="Close">✕</button>
+            </div>
+          </div>
+          ${nowTrack ? `
+            <div class="queue-now-playing">
+              <span class="queue-now-label">Now playing</span>
+              <div class="queue-item">
+                ${nowTrack.artUrl
+                  ? `<img class="art-thumb" src="${nowTrack.artUrl}" alt="" />`
+                  : `<span class="mono" style="background:${monoColor(nowTrack.title)}">${monoLetter(nowTrack.title)}</span>`}
+                <div class="meta"><div class="title">${escapeHtml(nowTrack.title)}</div></div>
+              </div>
+            </div>` : ''}
+          <div class="queue-list">${rows}</div>
+        </div>
+      </div>`;
+
+    document.getElementById('queueOverlay').addEventListener('click', (e) => {
+      if (e.target.id === 'queueOverlay') { queuePanelOpen = false; render(); }
+    });
+    document.getElementById('closeQueueBtn').addEventListener('click', () => { queuePanelOpen = false; render(); });
+    document.getElementById('clearQueueBtn')?.addEventListener('click', clearQueue);
+    queueEl.querySelectorAll('[data-queue-up]').forEach((el) => {
+      el.addEventListener('click', () => moveQueueItem(parseInt(el.dataset.queueUp, 10), -1));
+    });
+    queueEl.querySelectorAll('[data-queue-down]').forEach((el) => {
+      el.addEventListener('click', () => moveQueueItem(parseInt(el.dataset.queueDown, 10), 1));
+    });
+    queueEl.querySelectorAll('[data-queue-remove]').forEach((el) => {
+      el.addEventListener('click', () => removeFromQueue(parseInt(el.dataset.queueRemove, 10)));
+    });
   }
 
   // ---------- Install prompt ----------
