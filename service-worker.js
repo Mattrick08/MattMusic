@@ -1,7 +1,7 @@
 // MattMusic service worker — caches the app shell so it launches offline.
 // Your mp3 files themselves live in IndexedDB (see db.js), not the cache.
 
-const CACHE_NAME = 'mattmusic-shell-v6';
+const CACHE_NAME = 'mattmusic-shell-v7';
 const SHELL_FILES = [
   './',
   './index.html',
