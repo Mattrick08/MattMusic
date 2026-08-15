@@ -48,14 +48,39 @@ body{
 }
 
 header{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
   padding: 6px 4px 20px;
   border-bottom: 1px solid var(--line);
   margin-bottom: 20px;
+}
+.header-top{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
   gap: 12px;
 }
+.header-sub{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+.theme-swatches{
+  display:flex;
+  gap: 7px;
+  flex-shrink:0;
+}
+.swatch{
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.12s ease;
+}
+.swatch:hover{ transform: scale(1.12); }
+.swatch.active{ border-color: var(--text); }
 .brand{
   display:flex;
   align-items:center;
@@ -318,6 +343,12 @@ input[type=file]{ display:none; }
 }
 .np-queue-btn:hover{ color: var(--text); }
 .np-queue-btn svg{ width:19px; height:19px; }
+.np-wave{
+  display:block;
+  width:100%;
+  height: 26px;
+  margin-bottom: 6px;
+}
 .queue-badge{
   position:absolute;
   top: 0px;
