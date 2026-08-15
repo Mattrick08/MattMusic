@@ -21,22 +21,32 @@
 <body>
 <div class="app" id="app">
   <header>
-    <div class="brand">
-      <svg class="brand-mark" id="brandMark" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="20" cy="20" r="18" fill="var(--bg)" stroke="var(--amber)" stroke-width="1.6"/>
-        <circle cx="20" cy="20" r="13.5" stroke="var(--sage)" stroke-width="1.1" opacity="0.8"/>
-        <circle cx="20" cy="20" r="9" stroke="var(--sage)" stroke-width="1.1" opacity="0.6"/>
-        <circle cx="20" cy="20" r="6.5" fill="var(--cream)"/>
-        <circle cx="20" cy="20" r="1.6" fill="var(--bg)"/>
-      </svg>
-      <div>
-        <h1>MattMusic</h1>
-        <span class="tagline">your library, offline</span>
+    <div class="header-top">
+      <div class="brand">
+        <svg class="brand-mark" id="brandMark" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="20" cy="20" r="18" fill="var(--bg)" stroke="var(--amber)" stroke-width="1.6"/>
+          <circle cx="20" cy="20" r="13.5" stroke="var(--sage)" stroke-width="1.1" opacity="0.8"/>
+          <circle cx="20" cy="20" r="9" stroke="var(--sage)" stroke-width="1.1" opacity="0.6"/>
+          <circle cx="20" cy="20" r="6.5" fill="var(--cream)"/>
+          <circle cx="20" cy="20" r="1.6" fill="var(--bg)"/>
+        </svg>
+        <div>
+          <h1>MattMusic</h1>
+          <span class="tagline">your library, offline</span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="tag" id="fileCount">no files loaded</span>
+        <button class="btn btn-ghost" id="installBtn" style="display:none;font-size:11px;padding:6px 12px;">Install</button>
       </div>
     </div>
-    <div style="display:flex;align-items:center;gap:10px;">
-      <span class="tag" id="fileCount">no files loaded</span>
-      <button class="btn btn-ghost" id="installBtn" style="display:none;font-size:11px;padding:6px 12px;">Install</button>
+    <div class="header-sub">
+      <span class="tag" id="storageTag" title="Storage used on this device"></span>
+      <div class="theme-swatches" id="themeSwatches">
+        <button class="swatch" data-theme="ember" style="background:linear-gradient(135deg,#E8A33D,#16221F)" title="Ember theme"></button>
+        <button class="swatch" data-theme="dusk" style="background:linear-gradient(135deg,#8C7AE6,#1A1B2E)" title="Dusk theme"></button>
+        <button class="swatch" data-theme="terracotta" style="background:linear-gradient(135deg,#E67E52,#241714)" title="Terracotta theme"></button>
+      </div>
     </div>
   </header>
 
