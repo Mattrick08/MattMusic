@@ -21,6 +21,74 @@
   let queue = [];              // array of track ids, front of array plays next
   let queuePanelOpen = false;
 
+  // ---------- Themes ----------
+
+  const THEMES = {
+    ember: {
+      '--bg': '#16221F', '--bg-2': '#182721', '--surface': '#1F2E29', '--surface-2': '#263B34',
+      '--text': '#EAE3D2', '--cream': '#EAE3D2', '--muted': '#8FA098',
+      '--amber': '#E8A33D', '--sage': '#6B8F71', '--line': '#33463F'
+    },
+    dusk: {
+      '--bg': '#1A1B2E', '--bg-2': '#1E2038', '--surface': '#242640', '--surface-2': '#2E3153',
+      '--text': '#E7E4F4', '--cream': '#E7E4F4', '--muted': '#9391B8',
+      '--amber': '#8C7AE6', '--sage': '#5C7AEA', '--line': '#35375A'
+    },
+    terracotta: {
+      '--bg': '#241714', '--bg-2': '#2A1B17', '--surface': '#33211B', '--surface-2': '#402A22',
+      '--text': '#F3E4D8', '--cream': '#F3E4D8', '--muted': '#B08A76',
+      '--amber': '#E67E52', '--sage': '#C2775A', '--line': '#4A362D'
+    }
+  };
+  let currentTheme = 'ember';
+
+  function applyTheme(name) {
+    const t = THEMES[name] || THEMES.ember;
+    currentTheme = THEMES[name] ? name : 'ember';
+    Object.entries(t).forEach(([k, v]) => document.documentElement.style.setProperty(k, v));
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', t['--bg']);
+    try { localStorage.setItem('mattmusic-theme', currentTheme); } catch (e) { /* storage may be unavailable */ }
+    document.querySelectorAll('.swatch').forEach((el) => {
+      el.classList.toggle('active', el.dataset.theme === currentTheme);
+    });
+  }
+
+  (function initTheme() {
+    let saved = 'ember';
+    try { saved = localStorage.getItem('mattmusic-theme') || 'ember'; } catch (e) { /* ignore */ }
+    applyTheme(saved);
+  })();
+
+  document.querySelectorAll('.swatch').forEach((el) => {
+    el.addEventListener('click', () => applyTheme(el.dataset.theme));
+  });
+
+  // ---------- Storage usage ----------
+
+  function fmtBytes(bytes) {
+    if (!bytes) return '0 MB';
+    const mb = bytes / (1024 * 1024);
+    if (mb < 1024) return mb.toFixed(mb < 10 ? 1 : 0) + ' MB';
+    return (mb / 1024).toFixed(2) + ' GB';
+  }
+
+  async function updateStorageInfo() {
+    const tag = document.getElementById('storageTag');
+    if (!tag) return;
+    const libraryBytes = library.reduce((sum, t) => sum + (t.blob ? t.blob.size : 0) + (t.art ? t.art.size : 0), 0);
+    let text = fmtBytes(libraryBytes) + ' in your library';
+    if (navigator.storage && navigator.storage.estimate) {
+      try {
+        const { usage, quota } = await navigator.storage.estimate();
+        if (usage != null && quota != null && quota > 0) {
+          text = fmtBytes(usage) + ' of ' + fmtBytes(quota) + ' used on this device';
+        }
+      } catch (e) { /* fall back to library-only estimate */ }
+    }
+    tag.textContent = text;
+  }
+
   function fmtTime(s) {
     if (!isFinite(s) || s == null) return '0:00';
     const m = Math.floor(s / 60);
@@ -256,6 +324,7 @@
     fileCount.textContent = library.length
       ? library.length + ' track' + (library.length === 1 ? '' : 's') + ' · saved on this device'
       : 'no files loaded';
+    updateStorageInfo();
   }
 
   // ---------- Export / Import (portable library file) ----------
@@ -367,6 +436,7 @@
   function playTrack(id) {
     const track = getTrackById(id);
     if (!track) return;
+    ensureAudioGraph();
     currentId = id;
     audio.src = track.url;
     audio.play().then(() => { isPlaying = true; render(); }).catch(() => { isPlaying = false; render(); });
@@ -380,6 +450,7 @@
       if (list.length) playTrack(list[0].id);
       return;
     }
+    ensureAudioGraph();
     if (isPlaying) { audio.pause(); isPlaying = false; }
     else { audio.play(); isPlaying = true; }
     render();
@@ -554,6 +625,62 @@
     render();
     showToast('Removed ' + n + ' track' + (n === 1 ? '' : 's') + ' from ' + activeView);
   }
+
+  // ---------- Waveform visualizer ----------
+  //
+  // A single Web Audio graph is created lazily on first playback (browsers
+  // require a user gesture before an AudioContext will run) and reused for
+  // the app's whole lifetime — createMediaElementSource() can only ever be
+  // called once per <audio> element, and we reuse one <audio> for every
+  // track, so the graph itself doesn't need rebuilding on track changes.
+
+  let audioCtx = null;
+  let analyser = null;
+  let waveData = null;
+
+  function ensureAudioGraph() {
+    if (audioCtx) {
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return;
+    }
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new Ctx();
+      const source = audioCtx.createMediaElementSource(audio);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 64;
+      analyser.smoothingTimeConstant = 0.75;
+      source.connect(analyser);
+      analyser.connect(audioCtx.destination); // keep audio flowing to speakers
+      waveData = new Uint8Array(analyser.frequencyBinCount);
+    } catch (err) {
+      audioCtx = null; // Web Audio unavailable — the bar stays flat, playback is unaffected
+    }
+  }
+
+  function drawWave() {
+    requestAnimationFrame(drawWave);
+    const canvas = document.getElementById('waveCanvas');
+    if (!canvas) return;
+    const ctx2d = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    ctx2d.clearRect(0, 0, w, h);
+    if (!analyser || !isPlaying) return;
+
+    analyser.getByteFrequencyData(waveData);
+    const amber = getComputedStyle(document.documentElement).getPropertyValue('--amber').trim() || '#E8A33D';
+    const sage = getComputedStyle(document.documentElement).getPropertyValue('--sage').trim() || '#6B8F71';
+    const barCount = waveData.length;
+    const barWidth = w / barCount;
+    for (let i = 0; i < barCount; i++) {
+      const v = waveData[i] / 255;
+      const barHeight = Math.max(2, v * h);
+      const x = i * barWidth;
+      ctx2d.fillStyle = i % 2 === 0 ? amber : sage;
+      ctx2d.fillRect(x + 1, h - barHeight, Math.max(1, barWidth - 2), barHeight);
+    }
+  }
+  drawWave();
 
   // ---------- Media Session (lock screen controls + background playback) ----------
   //
@@ -894,6 +1021,7 @@
             ${queue.length ? `<span class="queue-badge">${queue.length}</span>` : ''}
           </button>
         </div>
+        <canvas class="np-wave" id="waveCanvas" width="600" height="52"></canvas>
         <div class="np-progress">
           <span class="np-time" id="curTime">${fmtTime(audio.currentTime)}</span>
           <input type="range" id="seek" min="0" max="${track.duration || 0}" value="${audio.currentTime || 0}" step="0.1"/>
