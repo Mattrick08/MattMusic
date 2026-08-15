@@ -55,6 +55,84 @@
     return library.find((t) => t.id === id);
   }
 
+  // ---------- Cover art (ID3v2 APIC frame) ----------
+  // Reads embedded album art straight out of the mp3's own ID3v2 tag —
+  // no network calls, no third-party library, just a slice of bytes the
+  // file already carries.
+
+  function readSyncSafeInt(bytes, offset) {
+    return ((bytes[offset] & 0x7f) << 21) | ((bytes[offset + 1] & 0x7f) << 14) |
+           ((bytes[offset + 2] & 0x7f) << 7) | (bytes[offset + 3] & 0x7f);
+  }
+  function readInt32BE(bytes, offset) {
+    return ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+  }
+
+  function parseApicFrame(bytes) {
+    const encoding = bytes[0];
+    let i = 1;
+    let mimeEnd = i;
+    while (mimeEnd < bytes.length && bytes[mimeEnd] !== 0) mimeEnd++;
+    const mime = new TextDecoder('latin1').decode(bytes.slice(i, mimeEnd));
+    i = mimeEnd + 1;
+    const pictureType = bytes[i];
+    i += 1;
+    if (encoding === 1 || encoding === 2) { // UTF-16 description: 2-byte null terminator
+      let descEnd = i;
+      while (descEnd < bytes.length - 1 && !(bytes[descEnd] === 0 && bytes[descEnd + 1] === 0)) descEnd += 2;
+      i = descEnd + 2;
+    } else {
+      let descEnd = i;
+      while (descEnd < bytes.length && bytes[descEnd] !== 0) descEnd++;
+      i = descEnd + 1;
+    }
+    const data = bytes.slice(i);
+    if (!data.length) return null;
+    return { mime: mime || 'image/jpeg', pictureType, data };
+  }
+
+  async function extractCoverArt(blob) {
+    try {
+      const head = new Uint8Array(await blob.slice(0, 10).arrayBuffer());
+      if (head[0] !== 0x49 || head[1] !== 0x44 || head[2] !== 0x33) return null; // no "ID3" header
+      const majorVersion = head[3];
+      const flags = head[5];
+      const tagSize = readSyncSafeInt(head, 6);
+      if (tagSize <= 0 || tagSize > 24 * 1024 * 1024) return null; // sanity cap
+
+      const bytes = new Uint8Array(await blob.slice(10, 10 + tagSize).arrayBuffer());
+      let offset = 0;
+
+      if (flags & 0x40) { // extended header present — skip over it
+        const extSize = majorVersion >= 4 ? readSyncSafeInt(bytes, 0) : readInt32BE(bytes, 0);
+        offset += extSize;
+      }
+
+      let best = null;
+      while (offset < bytes.length - 10) {
+        const id = String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+        if (id === '\u0000\u0000\u0000\u0000') break; // padding reached
+        const frameSize = majorVersion >= 4 ? readSyncSafeInt(bytes, offset + 4) : readInt32BE(bytes, offset + 4);
+        const frameStart = offset + 10;
+        if (frameSize <= 0 || frameStart + frameSize > bytes.length) break;
+
+        if (id === 'APIC') {
+          const parsed = parseApicFrame(bytes.slice(frameStart, frameStart + frameSize));
+          if (parsed) {
+            if (!best || parsed.pictureType === 3) best = parsed;
+            if (parsed.pictureType === 3) break; // "front cover" — good enough, stop looking
+          }
+        }
+        offset = frameStart + frameSize;
+      }
+
+      if (!best) return null;
+      return new Blob([best.data], { type: best.mime });
+    } catch (err) {
+      return null; // malformed/unsupported tag — fall back to the mono avatar
+    }
+  }
+
   // ---------- Loading & persistence ----------
 
   async function bootstrap() {
@@ -62,6 +140,7 @@
     stored.forEach((t) => {
       t.url = URL.createObjectURL(t.blob);
       t.addedAt = t.addedAt || 0; // tracks saved before this field existed
+      t.artUrl = t.art ? URL.createObjectURL(t.art) : null;
       library.push(t);
     });
     const storedPlaylists = await DB.getAllPlaylists();
@@ -69,6 +148,18 @@
 
     updateFileCount();
     render();
+    backfillArt(); // fetch cover art for tracks added before this feature existed
+  }
+
+  async function backfillArt() {
+    for (const t of library) {
+      if (t.artChecked) continue;
+      const art = await extractCoverArt(t.blob);
+      t.artChecked = true;
+      if (art) { t.art = art; t.artUrl = URL.createObjectURL(art); }
+      await DB.updateTrack({ id: t.id, name: t.name, blob: t.blob, title: t.title, duration: t.duration, addedAt: t.addedAt, art: t.art || null, artChecked: true });
+      if (art) render();
+    }
   }
 
   async function loadFiles(fileList) {
@@ -90,23 +181,38 @@
     const url = URL.createObjectURL(blob);
     const title = filename.replace(/\.[^/.]+$/, '');
     const addedAt = Date.now();
-    const track = { id, name: filename, blob, url, title, duration: null, addedAt };
+    const track = { id, name: filename, blob, url, title, duration: null, addedAt, art: null, artUrl: null, artChecked: false };
     library.push(track);
-    await DB.addTrack({ id, name: filename, blob, title, duration: null, addedAt });
+    await DB.addTrack({ id, name: filename, blob, title, duration: null, addedAt, art: null, artChecked: false });
 
     const probe = new Audio(url);
     probe.addEventListener('loadedmetadata', () => {
       track.duration = probe.duration;
-      DB.updateTrack({ id, name: filename, blob, title, duration: probe.duration, addedAt });
+      DB.updateTrack({ id, name: filename, blob, title, duration: probe.duration, addedAt, art: track.art, artChecked: track.artChecked });
       render();
     });
+
+    extractCoverArt(blob).then((art) => {
+      track.artChecked = true;
+      if (art) { track.art = art; track.artUrl = URL.createObjectURL(art); }
+      DB.updateTrack({ id, name: filename, blob, title, duration: track.duration, addedAt, art: track.art, artChecked: true });
+      if (art) {
+        render();
+        if (currentId === id) updateMediaSession(track); // refresh lock-screen art if it's playing already
+      }
+    });
+
     return track;
   }
 
   async function bulkDeleteTracks(ids) {
     const idSet = new Set(ids);
     library = library.filter((t) => {
-      if (idSet.has(t.id)) { URL.revokeObjectURL(t.url); return false; }
+      if (idSet.has(t.id)) {
+        URL.revokeObjectURL(t.url);
+        if (t.artUrl) URL.revokeObjectURL(t.artUrl);
+        return false;
+      }
       return true;
     });
     Object.keys(playlists).forEach((name) => {
@@ -137,9 +243,10 @@
     const title = next.trim();
     if (!title || title === track.title) return;
     track.title = title;
-    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title, duration: track.duration, addedAt: track.addedAt });
+    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title, duration: track.duration, addedAt: track.addedAt, art: track.art || null, artChecked: !!track.artChecked });
     render();
     showToast('Renamed to "' + title + '"');
+    if (currentId === id) updateMediaSession(track); // keep lock-screen title in sync
   }
 
   function updateFileCount() {
@@ -214,8 +321,10 @@
 
         const url = URL.createObjectURL(blob);
         const addedAt = t.addedAt || Date.now();
-        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration, addedAt });
-        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration, addedAt });
+        const art = await extractCoverArt(blob);
+        const artUrl = art ? URL.createObjectURL(art) : null;
+        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration, addedAt, art, artUrl, artChecked: true });
+        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration, addedAt, art, artChecked: true });
         added++;
       }
 
@@ -406,32 +515,64 @@
     showToast('Removed ' + n + ' track' + (n === 1 ? '' : 's') + ' from ' + activeView);
   }
 
-  // ---------- Media Session (lock screen controls) ----------
+  // ---------- Media Session (lock screen controls + background playback) ----------
+  //
+  // Properly declaring playbackState, artwork, and position on every change
+  // is what tells the phone's OS "this is real, active media" — it's the
+  // same signal Spotify/YouTube Music use to keep playing with the screen
+  // off. Without it, mobile browsers are much quicker to suspend a
+  // backgrounded tab/PWA and cut the audio.
 
   function updateMediaSession(track) {
-    if ('mediaSession' in navigator) {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: track.title,
-        artist: 'Your library',
-        album: activeView === 'library' ? 'Library' : activeView
+    if (!('mediaSession' in navigator)) return;
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: track.title,
+      artist: 'Your library',
+      album: activeView === 'library' ? 'Library' : activeView,
+      artwork: track.artUrl ? [
+        { src: track.artUrl, sizes: '512x512', type: (track.art && track.art.type) || 'image/jpeg' }
+      ] : []
+    });
+    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    navigator.mediaSession.setActionHandler('play', () => audio.play());
+    navigator.mediaSession.setActionHandler('pause', () => audio.pause());
+    navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
+    navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack(false));
+    navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); audio.currentTime = 0; });
+    try {
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        if (details.seekTime != null) audio.currentTime = details.seekTime;
       });
-      navigator.mediaSession.setActionHandler('play', () => { audio.play(); isPlaying = true; render(); });
-      navigator.mediaSession.setActionHandler('pause', () => { audio.pause(); isPlaying = false; render(); });
-      navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
-      navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack(false));
-    }
+    } catch (e) { /* not supported on every browser */ }
   }
 
   audio.addEventListener('ended', () => nextTrack(true));
   audio.addEventListener('timeupdate', renderProgressOnly);
-  audio.addEventListener('play', () => { isPlaying = true; renderControlsOnly(); });
-  audio.addEventListener('pause', () => { isPlaying = false; renderControlsOnly(); });
+  audio.addEventListener('play', () => {
+    isPlaying = true;
+    renderControlsOnly();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  });
+  audio.addEventListener('pause', () => {
+    isPlaying = false;
+    renderControlsOnly();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+  });
 
   function renderProgressOnly() {
     const bar = document.getElementById('seek');
     const cur = document.getElementById('curTime');
     if (bar && !bar.dragging) bar.value = audio.currentTime || 0;
     if (cur) cur.textContent = fmtTime(audio.currentTime);
+    if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession && isFinite(audio.duration) && audio.duration > 0) {
+      try {
+        navigator.mediaSession.setPositionState({
+          duration: audio.duration,
+          playbackRate: audio.playbackRate || 1,
+          position: Math.min(audio.currentTime, audio.duration)
+        });
+      } catch (e) { /* duration/position can be momentarily out of range mid-seek */ }
+    }
   }
   function renderControlsOnly() {
     const playBtn = document.getElementById('playBtnIcon');
@@ -516,7 +657,9 @@
         const eq = (isPl && isPlaying) ? '<span class="eq"><span></span><span></span><span></span></span>' : '';
         const leading = selectMode
           ? `<input type="checkbox" class="track-check" ${isSel ? 'checked' : ''} />`
-          : `<span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>`;
+          : (t.artUrl
+              ? `<img class="art-thumb" src="${t.artUrl}" alt="" />`
+              : `<span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>`);
         return `<div class="track ${isPl ? 'playing' : ''} ${isSel ? 'selected' : ''}" data-play="${t.id}">
           ${leading}
           <div class="meta"><div class="title">${eq}${escapeHtml(t.title)}</div></div>
@@ -696,7 +839,12 @@
 
     npEl.innerHTML = `
       <div class="np-inner">
-        <div class="np-track">${escapeHtml(track.title)}</div>
+        <div class="np-header">
+          ${track.artUrl
+            ? `<img class="np-art" src="${track.artUrl}" alt="" />`
+            : `<span class="np-art np-art-mono" style="background:${monoColor(track.title)}">${monoLetter(track.title)}</span>`}
+          <div class="np-track">${escapeHtml(track.title)}</div>
+        </div>
         <div class="np-progress">
           <span class="np-time" id="curTime">${fmtTime(audio.currentTime)}</span>
           <input type="range" id="seek" min="0" max="${track.duration || 0}" value="${audio.currentTime || 0}" step="0.1"/>
