@@ -64,6 +64,71 @@
     el.addEventListener('click', () => applyTheme(el.dataset.theme));
   });
 
+  // ---------- Rain overlay ----------
+  // A separate <audio> element looping rain.mp3 on top of the music. It is
+  // deliberately NOT routed through the Web Audio graph, so the music's
+  // background playback path stays untouched. The file is fetched once
+  // (cached by the service worker, so it works offline afterwards) and
+  // played from a blob URL to avoid range-request quirks.
+
+  const rainAudio = document.getElementById('rainAudio');
+  const rainBtn = document.getElementById('rainBtn');
+  const rainVol = document.getElementById('rainVol');
+  let rainOn = false;
+  let rainReady = false;
+
+  function setRainUI() {
+    rainBtn.classList.toggle('active', rainOn);
+    rainBtn.setAttribute('aria-pressed', String(rainOn));
+  }
+
+  async function loadRain() {
+    if (rainReady) return true;
+    rainBtn.classList.add('loading');
+    try {
+      const res = await fetch('rain.mp3');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      rainAudio.src = URL.createObjectURL(await res.blob());
+      rainReady = true;
+      return true;
+    } catch (e) {
+      showToast('Rain sound unavailable offline');
+      return false;
+    } finally {
+      rainBtn.classList.remove('loading');
+    }
+  }
+
+  async function setRain(on) {
+    if (on) {
+      if (!(await loadRain())) return;
+      try { await rainAudio.play(); } catch (e) { showToast('Could not start rain'); return; }
+    } else {
+      rainAudio.pause();
+    }
+    rainOn = on;
+    setRainUI();
+    try { localStorage.setItem('mattmusic-rain', on ? '1' : '0'); } catch (e) { /* ignore */ }
+  }
+
+  rainBtn.addEventListener('click', () => setRain(!rainOn));
+  rainVol.addEventListener('input', () => {
+    rainAudio.volume = rainVol.value / 100;
+    try { localStorage.setItem('mattmusic-rain-vol', rainVol.value); } catch (e) { /* ignore */ }
+  });
+
+  (function initRain() {
+    let vol = 50;
+    try {
+      const v = parseInt(localStorage.getItem('mattmusic-rain-vol'), 10);
+      if (!isNaN(v)) vol = Math.min(100, Math.max(0, v));
+    } catch (e) { /* ignore */ }
+    rainVol.value = vol;
+    rainAudio.volume = vol / 100;
+    // Browsers block autoplay without a gesture, so the saved on/off state
+    // is not auto-resumed; the user taps Rain to start it each session.
+  })();
+
   // ---------- Storage usage ----------
 
   function fmtBytes(bytes) {
