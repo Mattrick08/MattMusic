@@ -116,6 +116,9 @@ header{
   opacity: 0.45;
 }
 .rain-btn.active + #rainVol{ opacity: 1; }
+#rainVol{ min-width: 60px; }
+#sleepLabel{ min-width: 3.2ch; }
+.fav-btn.on, .np-fav-btn.on{ color: var(--amber); }
 .brand{
   display:flex;
   align-items:center;
