@@ -349,7 +349,6 @@
     const storedPlaylists = await DB.getAllPlaylists();
     storedPlaylists.forEach((p) => { playlists[p.name] = p.trackIds; });
 
-    restoreResume();
     updateFileCount();
     render();
     backfillArt(); // fetch cover art for tracks added before this feature existed
@@ -521,4 +520,781 @@
 
       const headerLen = dv.getUint32(4, true);
       const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, headerLen)));
-      let offse
+      let offset = 8 + headerLen;
+
+      const idMap = {};
+      let added = 0;
+      for (const t of (meta.tracks || [])) {
+        const size = t.size || 0;
+        const slice = buf.slice(offset, offset + size);
+        offset += size;
+
+        const blob = new Blob([slice], { type: t.mime || 'audio/mpeg' });
+        const newId = 'trk_' + Math.random().toString(36).slice(2, 10);
+        idMap[t.id] = newId;
+
+        const url = URL.createObjectURL(blob);
+        const addedAt = t.addedAt || Date.now();
+        const art = await extractCoverArt(blob);
+        const artUrl = art ? URL.createObjectURL(art) : null;
+        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration, addedAt, art, artUrl, artChecked: true, fav: !!t.fav });
+        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration, addedAt, art, artChecked: true, fav: !!t.fav });
+        added++;
+      }
+
+      let newPlaylists = 0;
+      for (const [name, ids] of Object.entries(meta.playlists || {})) {
+        const mapped = (ids || []).map((id) => idMap[id]).filter(Boolean);
+        if (playlists[name]) {
+          playlists[name] = Array.from(new Set([...playlists[name], ...mapped]));
+        } else {
+          playlists[name] = mapped;
+          newPlaylists++;
+        }
+        await DB.savePlaylist(name, playlists[name]);
+      }
+
+      updateFileCount();
+      render();
+      const bits = [added + ' track' + (added === 1 ? '' : 's')];
+      if (newPlaylists) bits.push(newPlaylists + ' playlist' + (newPlaylists === 1 ? '' : 's'));
+      showToast('Imported ' + bits.join(', '));
+    } catch (err) {
+      console.error('Import failed:', err);
+      showToast('Import failed — file may be corrupted');
+    }
+  }
+
+  function triggerImportPicker() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.mmlib';
+    input.addEventListener('change', (e) => {
+      if (e.target.files[0]) importLibraryFile(e.target.files[0]);
+    });
+    input.click();
+  }
+
+  function playTrack(id) {
+    const track = getTrackById(id);
+    if (!track) return;
+    ensureAudioGraph();
+    currentId = id;
+    audio.src = track.url;
+    audio.play().then(() => { isPlaying = true; render(); }).catch(() => { isPlaying = false; render(); });
+    updateMediaSession(track);
+    render();
+  }
+
+  function togglePlay() {
+    if (!currentId) {
+      const list = currentList();
+      if (list.length) playTrack(list[0].id);
+      return;
+    }
+    ensureAudioGraph();
+    if (isPlaying) { audio.pause(); isPlaying = false; }
+    else { audio.play(); isPlaying = true; }
+    render();
+  }
+
+  function buildShuffleOrder() {
+    const list = currentList().map((t) => t.id);
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    shuffleOrder = list;
+  }
+
+  function nextTrack(auto) {
+    if (repeatMode === 'one' && auto) { playTrack(currentId); return; }
+    if (queue.length) {
+      const id = queue.shift();
+      if (!getTrackById(id)) { render(); nextTrack(auto); return; } // stale id (deleted track) — skip it
+      playTrack(id);
+      return;
+    }
+    const list = currentList();
+    if (!list.length) return;
+    let order = shuffle ? shuffleOrder : list.map((t) => t.id);
+    if (shuffle && (!order.length || !order.includes(currentId))) { buildShuffleOrder(); order = shuffleOrder; }
+    let idx = order.indexOf(currentId);
+    idx = (idx + 1) % order.length;
+    if (idx === 0 && auto && repeatMode !== 'all' && !shuffle) {
+      isPlaying = false; render(); return;
+    }
+    playTrack(order[idx]);
+  }
+
+  function prevTrack() {
+    const list = currentList();
+    if (!list.length) return;
+    let order = shuffle ? shuffleOrder : list.map((t) => t.id);
+    let idx = order.indexOf(currentId);
+    idx = (idx - 1 + order.length) % order.length;
+    playTrack(order[idx]);
+  }
+
+  function toggleShuffle() {
+    shuffle = !shuffle;
+    if (shuffle) buildShuffleOrder();
+    render();
+  }
+
+  function cycleRepeat() {
+    repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off';
+    render();
+  }
+
+  // ---------- Queue (up next) ----------
+
+  function addToQueue(id) {
+    if (!getTrackById(id)) return;
+    queue.push(id);
+    render();
+    showToast('Added to queue');
+  }
+
+  function removeFromQueue(index) {
+    queue.splice(index, 1);
+    render();
+  }
+
+  function moveQueueItem(index, dir) {
+    const target = index + dir;
+    if (target < 0 || target >= queue.length) return;
+    [queue[index], queue[target]] = [queue[target], queue[index]];
+    render();
+  }
+
+  function clearQueue() {
+    queue = [];
+    render();
+  }
+
+  function toggleQueuePanel() {
+    queuePanelOpen = !queuePanelOpen;
+    render();
+  }
+
+  // ---------- Playlists ----------
+
+  function createPlaylist(name) {
+    name = name.trim();
+    if (!name || playlists[name]) return;
+    playlists[name] = [];
+    DB.savePlaylist(name, []);
+    activeView = name;
+    creatingPlaylist = false;
+    render();
+    showToast('Playlist "' + name + '" created');
+  }
+
+  function deletePlaylist(name) {
+    if (!confirm('Delete playlist "' + name + '"? Tracks stay in your library.')) return;
+    delete playlists[name];
+    DB.deletePlaylist(name);
+    if (activeView === name) activeView = 'library';
+    render();
+  }
+
+  function addToPlaylist(trackId, plName) {
+    if (!playlists[plName].includes(trackId)) {
+      playlists[plName].push(trackId);
+      DB.savePlaylist(plName, playlists[plName]);
+      showToast('Added to ' + plName);
+    }
+    render();
+  }
+
+  function removeFromPlaylist(trackId, plName) {
+    playlists[plName] = playlists[plName].filter((id) => id !== trackId);
+    DB.savePlaylist(plName, playlists[plName]);
+    render();
+  }
+
+  // ---------- Bulk selection ----------
+
+  function toggleSelect(id) {
+    if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
+    render();
+  }
+
+  function selectAllVisible() {
+    const list = currentList();
+    const allSelected = list.length > 0 && list.every((t) => selectedIds.has(t.id));
+    if (allSelected) list.forEach((t) => selectedIds.delete(t.id));
+    else list.forEach((t) => selectedIds.add(t.id));
+    render();
+  }
+
+  async function bulkDelete() {
+    if (!selectedIds.size) return;
+    const ids = Array.from(selectedIds);
+    const n = ids.length;
+    if (!confirm('Delete ' + n + ' track' + (n === 1 ? '' : 's') + ' from your library? This removes the files from this device.')) return;
+    await bulkDeleteTracks(ids);
+    selectMode = false;
+    render();
+    showToast('Deleted ' + n + ' track' + (n === 1 ? '' : 's'));
+  }
+
+  function bulkAddToPlaylist() {
+    const names = Object.keys(playlists);
+    if (!names.length) { showToast('Create a playlist first'); return; }
+    const n = selectedIds.size;
+    const choice = names.length === 1 ? names[0] : prompt('Add ' + n + ' track' + (n === 1 ? '' : 's') + ' to which playlist?\n' + names.join(', '));
+    if (!choice || !playlists[choice]) return;
+    let added = 0;
+    selectedIds.forEach((id) => {
+      if (!playlists[choice].includes(id)) { playlists[choice].push(id); added++; }
+    });
+    DB.savePlaylist(choice, playlists[choice]);
+    selectedIds.clear();
+    selectMode = false;
+    render();
+    showToast('Added ' + added + ' track' + (added === 1 ? '' : 's') + ' to ' + choice);
+  }
+
+  function bulkRemoveFromPlaylist() {
+    const n = selectedIds.size;
+    if (!n) return;
+    playlists[activeView] = playlists[activeView].filter((id) => !selectedIds.has(id));
+    DB.savePlaylist(activeView, playlists[activeView]);
+    selectedIds.clear();
+    selectMode = false;
+    render();
+    showToast('Removed ' + n + ' track' + (n === 1 ? '' : 's') + ' from ' + activeView);
+  }
+
+  // ---------- Waveform visualizer ----------
+  //
+  // A single Web Audio graph is created lazily on first playback (browsers
+  // require a user gesture before an AudioContext will run) and reused for
+  // the app's whole lifetime — createMediaElementSource() can only ever be
+  // called once per <audio> element, and we reuse one <audio> for every
+  // track, so the graph itself doesn't need rebuilding on track changes.
+
+  let audioCtx = null;
+  let analyser = null;
+  let waveData = null;
+
+  function ensureAudioGraph() {
+    if (audioCtx) {
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return;
+    }
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new Ctx();
+      const source = audioCtx.createMediaElementSource(audio);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 64;
+      analyser.smoothingTimeConstant = 0.75;
+      source.connect(analyser);
+      analyser.connect(audioCtx.destination); // keep audio flowing to speakers
+      waveData = new Uint8Array(analyser.frequencyBinCount);
+    } catch (err) {
+      audioCtx = null; // Web Audio unavailable — the bar stays flat, playback is unaffected
+    }
+  }
+
+  function drawWave() {
+    requestAnimationFrame(drawWave);
+    const canvas = document.getElementById('waveCanvas');
+    if (!canvas) return;
+    const ctx2d = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    ctx2d.clearRect(0, 0, w, h);
+    if (!analyser || !isPlaying) return;
+
+    analyser.getByteFrequencyData(waveData);
+    const amber = getComputedStyle(document.documentElement).getPropertyValue('--amber').trim() || '#E8A33D';
+    const sage = getComputedStyle(document.documentElement).getPropertyValue('--sage').trim() || '#6B8F71';
+    const barCount = waveData.length;
+    const barWidth = w / barCount;
+    for (let i = 0; i < barCount; i++) {
+      const v = waveData[i] / 255;
+      const barHeight = Math.max(2, v * h);
+      const x = i * barWidth;
+      ctx2d.fillStyle = i % 2 === 0 ? amber : sage;
+      ctx2d.fillRect(x + 1, h - barHeight, Math.max(1, barWidth - 2), barHeight);
+    }
+  }
+  drawWave();
+
+  // ---------- Media Session (lock screen controls + background playback) ----------
+  //
+  // Properly declaring playbackState, artwork, and position on every change
+  // is what tells the phone's OS "this is real, active media" — it's the
+  // same signal Spotify/YouTube Music use to keep playing with the screen
+  // off. Without it, mobile browsers are much quicker to suspend a
+  // backgrounded tab/PWA and cut the audio.
+
+  function updateMediaSession(track) {
+    if (!('mediaSession' in navigator)) return;
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: track.title,
+      artist: 'Your library',
+      album: viewLabel(),
+      artwork: track.artUrl ? [
+        { src: track.artUrl, sizes: '512x512', type: (track.art && track.art.type) || 'image/jpeg' }
+      ] : []
+    });
+    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    navigator.mediaSession.setActionHandler('play', () => audio.play());
+    navigator.mediaSession.setActionHandler('pause', () => audio.pause());
+    navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
+    navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack(false));
+    navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); audio.currentTime = 0; });
+    try {
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        if (details.seekTime != null) audio.currentTime = details.seekTime;
+      });
+    } catch (e) { /* not supported on every browser */ }
+  }
+
+  audio.addEventListener('ended', () => nextTrack(true));
+  audio.addEventListener('timeupdate', renderProgressOnly);
+  audio.addEventListener('play', () => {
+    isPlaying = true;
+    renderControlsOnly();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  });
+  audio.addEventListener('pause', () => {
+    isPlaying = false;
+    renderControlsOnly();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+  });
+
+  function renderProgressOnly() {
+    const bar = document.getElementById('seek');
+    const cur = document.getElementById('curTime');
+    if (bar && !bar.dragging) bar.value = audio.currentTime || 0;
+    if (cur) cur.textContent = fmtTime(audio.currentTime);
+    if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession && isFinite(audio.duration) && audio.duration > 0) {
+      try {
+        navigator.mediaSession.setPositionState({
+          duration: audio.duration,
+          playbackRate: audio.playbackRate || 1,
+          position: Math.min(audio.currentTime, audio.duration)
+        });
+      } catch (e) { /* duration/position can be momentarily out of range mid-seek */ }
+    }
+  }
+  function renderControlsOnly() {
+    const playBtn = document.getElementById('playBtnIcon');
+    if (playBtn) playBtn.innerHTML = isPlaying ? iconPause() : iconPlay();
+    syncBrandMark();
+  }
+
+  function syncBrandMark() {
+    const mark = document.getElementById('brandMark');
+    if (!mark) return;
+    mark.classList.toggle('spinning', isPlaying);
+  }
+
+  function iconPlay() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'; }
+  function iconPause() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>'; }
+
+  // ---------- Rendering ----------
+
+  function escapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // A few warm tints drawn from the palette, rotated by a hash of the
+  // title so each track gets a stable, distinct monogram color.
+  const MONO_COLORS = ['#E8A33D', '#6B8F71', '#C97B4A', '#7FA8A0', '#D9B15C'];
+  function monoColor(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+    return MONO_COLORS[h % MONO_COLORS.length];
+  }
+  function monoLetter(title) {
+    const m = title.trim().match(/[a-zA-Z0-9]/);
+    return m ? m[0].toUpperCase() : '♪';
+  }
+
+  function render() {
+    // Preserve focus/cursor in the search box across the innerHTML rebuild below.
+    const searchFocused = document.activeElement && document.activeElement.id === 'searchInput';
+    const searchSel = searchFocused ? document.activeElement.selectionStart : null;
+
+    const tabsHtml = ['library', FAV, ...Object.keys(playlists)].map((name) => {
+      const label = name === 'library' ? 'Library' : name === FAV ? '♥ Favorites' : escapeHtml(name);
+      const del = (name !== 'library' && name !== FAV) ?`<span class="del" data-del-playlist="${escapeHtml(name)}">✕</span>` : '';
+      return `<div class="tab ${activeView === name ? 'active' : ''}" data-view="${escapeHtml(name)}">${label}${del}</div>`;
+    }).join('') + `<div class="tab new" id="newPlaylistTab">+ New playlist</div>`;
+
+    const list = currentList();
+
+    let listHtml;
+    if (library.length === 0) {
+      listHtml = `
+        <div class="empty">
+          <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="#6B8F71" stroke-width="1.3"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/><path d="M12 3v3M12 18v3"/></svg>
+          <p>Load mp3s from your device to start. They're stored on this device so they're here next time, even offline.</p>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;">
+            <button class="btn btn-primary" id="loadBtn">Choose files</button>
+            <button class="btn btn-ghost" id="loadFolderBtnEmpty">Add a folder</button>
+            <button class="btn btn-ghost" id="importBtnEmpty">Import library file</button>
+          </div>
+        </div>`;
+    } else if (list.length === 0) {
+      listHtml = searchQuery.trim()
+        ? `<div class="tracklist"><div class="empty-list">No tracks match "${escapeHtml(searchQuery.trim())}".</div></div>`
+        : activeView === FAV
+        ? `<div class="tracklist"><div class="empty-list">No favorites yet. Tap ♡ on a track to add it here.</div></div>`
+        : `<div class="tracklist"><div class="empty-list">No tracks in "${escapeHtml(activeView)}" yet. Add some from your Library.</div></div>`;
+    } else {
+      listHtml = `<div class="tracklist">` + list.map((t, i) => {
+        const isPl = t.id === currentId;
+        const isSel = selectedIds.has(t.id);
+        let actionBtn = '';
+        if (!selectMode) {
+          const queueBtn = `<button class="icon-btn" data-queue-add="${t.id}" title="Add to queue">Q+</button>`;
+          const favBtn = `<button class="icon-btn fav-btn ${t.fav ? 'on' : ''}" data-fav="${t.id}" title="${t.fav ? 'Remove from Favorites' : 'Add to Favorites'}">${t.fav ? '♥' : '♡'}</button>`;
+          if (isLibLike()) {
+            const addBtn = Object.keys(playlists).length
+              ? `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`
+              : '';
+            actionBtn = favBtn + `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + queueBtn + addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
+          } else {
+            actionBtn = favBtn + `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + queueBtn + `<button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
+          }
+        }
+        const eq = (isPl && isPlaying) ? '<span class="eq"><span></span><span></span><span></span></span>' : '';
+        const leading = selectMode
+          ? `<input type="checkbox" class="track-check" ${isSel ? 'checked' : ''} />`
+          : (t.artUrl
+              ? `<img class="art-thumb" src="${t.artUrl}" alt="" />`
+              : `<span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>`);
+        return `<div class="track ${isPl ? 'playing' : ''} ${isSel ? 'selected' : ''}" data-play="${t.id}">
+          ${leading}
+          <div class="meta"><div class="title">${eq}${escapeHtml(t.title)}</div></div>
+          <span class="dur">${t.duration ? fmtTime(t.duration) : '--:--'}</span>
+          ${actionBtn}
+        </div>`;
+      }).join('') + `</div>`;
+    }
+
+    const newPlaylistForm = creatingPlaylist ? `
+      <div class="new-playlist-form">
+        <input id="newPlName" placeholder="Playlist name" autofocus />
+        <button class="btn btn-primary" id="confirmNewPl">Create</button>
+      </div>` : '';
+
+    const searchSortRow = library.length ? `
+      <div class="search-sort-row">
+        <input type="search" id="searchInput" class="search-input" placeholder="Search titles…" value="${escapeHtml(searchQuery)}" />
+        <select id="sortSelect" class="sort-select" title="Sort by">
+          <option value="added" ${sortMode === 'added' ? 'selected' : ''}>Recently added</option>
+          <option value="alpha" ${sortMode === 'alpha' ? 'selected' : ''}>Title (A–Z)</option>
+          <option value="duration" ${sortMode === 'duration' ? 'selected' : ''}>Duration</option>
+        </select>
+      </div>` : '';
+
+    let toolbarRow;
+    if (selectMode) {
+      const allVisibleSelected = list.length > 0 && list.every((t) => selectedIds.has(t.id));
+      const addAction = (isLibLike() && Object.keys(playlists).length)
+        ? `<button class="btn btn-ghost sm" id="bulkAddBtn">＋ Add to playlist</button>` : '';
+      const removeAction = !isLibLike()
+        ? `<button class="btn btn-ghost sm" id="bulkRemoveBtn">✕ Remove from playlist</button>` : '';
+      const deleteAction = isLibLike()
+        ? `<button class="btn btn-ghost sm danger" id="bulkDeleteBtn">🗑 Delete</button>` : '';
+      toolbarRow = `
+        <div class="bulk-bar">
+          <span class="bulk-count">${selectedIds.size} selected</span>
+          <button class="btn btn-ghost sm" id="selectAllBtn">${allVisibleSelected ? 'Deselect all' : 'Select all'}</button>
+          ${addAction}${removeAction}${deleteAction}
+          <button class="btn btn-ghost sm" id="cancelSelectBtn">Cancel</button>
+        </div>`;
+    } else {
+      toolbarRow = `
+        <div class="toolbar-row">
+          <button class="btn btn-ghost sm" id="loadMoreBtn">+ Add more files</button>
+          <button class="btn btn-ghost sm" id="loadFolderBtn">+ Add folder</button>
+          <button class="btn btn-ghost sm" id="selectModeBtn">☑ Select</button>
+          <button class="btn btn-ghost sm" id="exportBtn">↓ Export library</button>
+          <button class="btn btn-ghost sm" id="importBtn">↑ Import library</button>
+        </div>`;
+    }
+
+    const header = library.length ? `
+      <div class="tabs">${tabsHtml}</div>
+      ${newPlaylistForm}
+      <div class="section-label">${activeView === 'library' ? 'Your library' : escapeHtml(viewLabel())}</div>
+      ${searchSortRow}
+      ${toolbarRow}
+    ` : '';
+
+    content.innerHTML = header + listHtml;
+
+    document.getElementById('loadBtn')?.addEventListener('click', triggerFilePicker);
+    document.getElementById('loadMoreBtn')?.addEventListener('click', triggerFilePicker);
+    document.getElementById('loadFolderBtn')?.addEventListener('click', triggerFolderPicker);
+    document.getElementById('loadFolderBtnEmpty')?.addEventListener('click', triggerFolderPicker);
+    document.getElementById('exportBtn')?.addEventListener('click', exportLibrary);
+    document.getElementById('importBtn')?.addEventListener('click', triggerImportPicker);
+    document.getElementById('importBtnEmpty')?.addEventListener('click', triggerImportPicker);
+    document.getElementById('newPlaylistTab')?.addEventListener('click', () => {
+      creatingPlaylist = true; render();
+      setTimeout(() => document.getElementById('newPlName')?.focus(), 0);
+    });
+    document.getElementById('confirmNewPl')?.addEventListener('click', () => {
+      createPlaylist(document.getElementById('newPlName').value);
+    });
+    document.getElementById('newPlName')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') createPlaylist(e.target.value);
+    });
+    document.getElementById('searchInput')?.addEventListener('input', (e) => {
+      searchQuery = e.target.value; render();
+    });
+    document.getElementById('sortSelect')?.addEventListener('change', (e) => {
+      sortMode = e.target.value; render();
+    });
+    document.getElementById('selectModeBtn')?.addEventListener('click', () => {
+      selectMode = true; selectedIds.clear(); render();
+    });
+    document.getElementById('cancelSelectBtn')?.addEventListener('click', () => {
+      selectMode = false; selectedIds.clear(); render();
+    });
+    document.getElementById('selectAllBtn')?.addEventListener('click', selectAllVisible);
+    document.getElementById('bulkAddBtn')?.addEventListener('click', bulkAddToPlaylist);
+    document.getElementById('bulkRemoveBtn')?.addEventListener('click', bulkRemoveFromPlaylist);
+    document.getElementById('bulkDeleteBtn')?.addEventListener('click', bulkDelete);
+
+    content.querySelectorAll('[data-view]').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        if (e.target.closest('[data-del-playlist]')) return;
+        activeView = el.dataset.view; creatingPlaylist = false; selectMode = false; selectedIds.clear(); render();
+      });
+    });
+    content.querySelectorAll('[data-del-playlist]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); deletePlaylist(el.dataset.delPlaylist); });
+    });
+    content.querySelectorAll('[data-play]').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        if (e.target.closest('[data-add],[data-remove-from],[data-delete],[data-rename],[data-queue-add],[data-fav]')) return;
+        if (selectMode) { toggleSelect(el.dataset.play); return; }
+        playTrack(el.dataset.play);
+      });
+    });
+    content.querySelectorAll('[data-add]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); showAddMenu(el.dataset.add); });
+    });
+    content.querySelectorAll('[data-remove-from]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); removeFromPlaylist(el.dataset.removeFrom, activeView); });
+    });
+    content.querySelectorAll('[data-rename]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); renameTrack(el.dataset.rename); });
+    });
+    content.querySelectorAll('[data-fav]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); toggleFav(el.dataset.fav); });
+    });
+    content.querySelectorAll('[data-queue-add]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); addToQueue(el.dataset.queueAdd); });
+    });
+    content.querySelectorAll('[data-delete]').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const track = getTrackById(el.dataset.delete);
+        const label = track ? track.title : 'this track';
+        if (confirm('Delete "' + label + '" from your library? This removes the file from this device.')) {
+          removeTrack(el.dataset.delete);
+        }
+      });
+    });
+
+    if (searchFocused) {
+      const si = document.getElementById('searchInput');
+      if (si) { si.focus(); si.setSelectionRange(searchSel, searchSel); }
+    }
+
+    renderNowPlaying();
+    renderQueuePanel();
+    syncBrandMark();
+  }
+
+  function showAddMenu(trackId) {
+    const names = Object.keys(playlists);
+    if (!names.length) return;
+    const choice = names.length === 1 ? names[0] : prompt('Add to which playlist?\n' + names.join(', '));
+    if (choice && playlists[choice]) addToPlaylist(trackId, choice);
+  }
+
+  function triggerFilePicker() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.accept = 'audio/*';
+    input.addEventListener('change', (e) => loadFiles(e.target.files));
+    input.click();
+  }
+
+  function triggerFolderPicker() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.webkitdirectory = true; // recursive folder picker (Chrome/Edge/Safari; Firefox falls back to normal picker)
+    input.addEventListener('change', (e) => loadFiles(e.target.files));
+    input.click();
+  }
+
+  let npEl = null;
+  function renderNowPlaying() {
+    const track = currentId ? getTrackById(currentId) : null;
+    if (!npEl) {
+      npEl = document.createElement('div');
+      npEl.className = 'now-playing';
+      document.body.appendChild(npEl);
+    }
+    if (!track) { npEl.style.display = 'none'; return; }
+    npEl.style.display = 'block';
+
+    npEl.innerHTML = `
+      <div class="np-inner">
+        <div class="np-header">
+          ${track.artUrl
+            ? `<img class="np-art" src="${track.artUrl}" alt="" />`
+            : `<span class="np-art np-art-mono" style="background:${monoColor(track.title)}">${monoLetter(track.title)}</span>`}
+          <div class="np-track">${escapeHtml(track.title)}</div>
+          <button class="np-queue-btn np-fav-btn ${track.fav ? 'on' : ''}" id="npFavBtn" title="${track.fav ? 'Remove from Favorites' : 'Add to Favorites'}">
+            <svg viewBox="0 0 24 24" fill="${track.fav ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 21s-7.5-4.6-9.5-9.2C1.2 8.6 3 5 6.5 5c2 0 3.6 1.1 5.5 3 1.9-1.9 3.5-3 5.5-3C21 5 22.8 8.6 21.5 11.8 19.5 16.4 12 21 12 21z"/></svg>
+          </button>
+          <button class="np-queue-btn" id="queueToggleBtn" title="Up next">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h11"/></svg>
+            ${queue.length ? `<span class="queue-badge">${queue.length}</span>` : ''}
+          </button>
+        </div>
+        <canvas class="np-wave" id="waveCanvas" width="600" height="52"></canvas>
+        <div class="np-progress">
+          <span class="np-time" id="curTime">${fmtTime(audio.currentTime)}</span>
+          <input type="range" id="seek" min="0" max="${track.duration || 0}" value="${audio.currentTime || 0}" step="0.1"/>
+          <span class="np-time end">${track.duration ? fmtTime(track.duration) : '--:--'}</span>
+        </div>
+        <div class="np-controls">
+          <button class="toggle ${shuffle ? 'on' : ''}" id="shuffleBtn" title="Shuffle">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4h4l7 16h5M4 20h4l3.5-8M17 4h4v4M17 20h4v-4"/></svg>
+          </button>
+          <button id="prevBtn"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zM20 6L10 12l10 6z"/></svg></button>
+          <button class="play-btn" id="playBtn"><span id="playBtnIcon">${isPlaying ? iconPause() : iconPlay()}</span></button>
+          <button id="nextBtn"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 6h2v12h-2zM4 6l10 6L4 18z"/></svg></button>
+          <button class="toggle ${repeatMode !== 'off' ? 'on' : ''}" id="repeatBtn" title="Repeat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 2l4 4-4 4M3 11V9a4 4 0 014-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 01-4 4H3"/>${repeatMode === 'one' ? '<text x="9" y="15.5" font-size="7" fill="currentColor" stroke="none">1</text>' : ''}</svg>
+          </button>
+        </div>
+      </div>`;
+
+    const seek = document.getElementById('seek');
+    seek.addEventListener('input', () => { seek.dragging = true; document.getElementById('curTime').textContent = fmtTime(seek.value); });
+    seek.addEventListener('change', () => { audio.currentTime = parseFloat(seek.value); seek.dragging = false; });
+
+    document.getElementById('playBtn').addEventListener('click', togglePlay);
+    document.getElementById('prevBtn').addEventListener('click', prevTrack);
+    document.getElementById('nextBtn').addEventListener('click', () => nextTrack(false));
+    document.getElementById('shuffleBtn').addEventListener('click', toggleShuffle);
+    document.getElementById('repeatBtn').addEventListener('click', cycleRepeat);
+    document.getElementById('queueToggleBtn').addEventListener('click', toggleQueuePanel);
+    document.getElementById('npFavBtn').addEventListener('click', () => toggleFav(track.id));
+  }
+
+  // ---------- Queue panel (up next) ----------
+
+  let queueEl = null;
+  function renderQueuePanel() {
+    if (!queueEl) {
+      queueEl = document.createElement('div');
+      document.body.appendChild(queueEl);
+    }
+    if (!queuePanelOpen) { queueEl.innerHTML = ''; return; }
+
+    const items = queue.map((id) => getTrackById(id)).filter(Boolean);
+    const nowTrack = currentId ? getTrackById(currentId) : null;
+
+    const rows = items.length ? items.map((t, i) => `
+      <div class="queue-item">
+        <span class="queue-pos">${i + 1}</span>
+        ${t.artUrl
+          ? `<img class="art-thumb" src="${t.artUrl}" alt="" />`
+          : `<span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>`}
+        <div class="meta"><div class="title">${escapeHtml(t.title)}</div></div>
+        <span class="dur">${t.duration ? fmtTime(t.duration) : '--:--'}</span>
+        <button class="icon-btn" data-queue-up="${i}" title="Move up" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="icon-btn" data-queue-down="${i}" title="Move down" ${i === items.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="icon-btn" data-queue-remove="${i}" title="Remove from queue">✕</button>
+      </div>`).join('')
+      : `<div class="empty-list">Nothing queued yet. Tap "Q+" next to a track to add it here.</div>`;
+
+    queueEl.innerHTML = `
+      <div class="queue-overlay" id="queueOverlay">
+        <div class="queue-sheet">
+          <div class="queue-sheet-header">
+            <div class="section-label" style="margin:0;">Up next${items.length ? ' · ' + items.length : ''}</div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              ${items.length ? `<button class="btn btn-ghost sm" id="clearQueueBtn">Clear</button>` : ''}
+              <button class="icon-btn" id="closeQueueBtn" title="Close">✕</button>
+            </div>
+          </div>
+          ${nowTrack ? `
+            <div class="queue-now-playing">
+              <span class="queue-now-label">Now playing</span>
+              <div class="queue-item">
+                ${nowTrack.artUrl
+                  ? `<img class="art-thumb" src="${nowTrack.artUrl}" alt="" />`
+                  : `<span class="mono" style="background:${monoColor(nowTrack.title)}">${monoLetter(nowTrack.title)}</span>`}
+                <div class="meta"><div class="title">${escapeHtml(nowTrack.title)}</div></div>
+              </div>
+            </div>` : ''}
+          <div class="queue-list">${rows}</div>
+        </div>
+      </div>`;
+
+    document.getElementById('queueOverlay').addEventListener('click', (e) => {
+      if (e.target.id === 'queueOverlay') { queuePanelOpen = false; render(); }
+    });
+    document.getElementById('closeQueueBtn').addEventListener('click', () => { queuePanelOpen = false; render(); });
+    document.getElementById('clearQueueBtn')?.addEventListener('click', clearQueue);
+    queueEl.querySelectorAll('[data-queue-up]').forEach((el) => {
+      el.addEventListener('click', () => moveQueueItem(parseInt(el.dataset.queueUp, 10), -1));
+    });
+    queueEl.querySelectorAll('[data-queue-down]').forEach((el) => {
+      el.addEventListener('click', () => moveQueueItem(parseInt(el.dataset.queueDown, 10), 1));
+    });
+    queueEl.querySelectorAll('[data-queue-remove]').forEach((el) => {
+      el.addEventListener('click', () => removeFromQueue(parseInt(el.dataset.queueRemove, 10)));
+    });
+  }
+
+  // ---------- Install prompt ----------
+
+  let deferredInstallPrompt = null;
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    const btn = document.getElementById('installBtn');
+    if (btn) btn.style.display = 'inline-block';
+  });
+  document.getElementById('installBtn')?.addEventListener('click', async () => {
+    if (!deferredInstallPrompt) return;
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    document.getElementById('installBtn').style.display = 'none';
+  });
+
+  // ---------- Service worker ----------
+
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./service-worker.js').catch(() => {});
+    });
+  }
+
+  bootstrap();
+})();
