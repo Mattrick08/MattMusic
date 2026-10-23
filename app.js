@@ -129,6 +129,64 @@
     // is not auto-resumed; the user taps Rain to start it each session.
   })();
 
+  // ---------- Sleep timer ----------
+  // Tap the Sleep button to cycle 15 → 30 → 60 min → off. For the last 20 s
+  // the music and rain fade out together, then both are paused. Uses the
+  // wall clock (Date.now) so a delayed tick can never overshoot the end.
+  // (iOS ignores audio.volume, so there the fade is a plain stop.)
+
+  const sleepBtn = document.getElementById('sleepBtn');
+  const sleepLabel = document.getElementById('sleepLabel');
+  const SLEEP_STEPS = [15, 30, 60]; // minutes
+  const SLEEP_FADE_MS = 20000;
+  let sleepEnd = 0;
+  let sleepTimer = null;
+  let sleepStep = -1;
+
+  function rainBaseVolume() { return rainVol.value / 100; }
+
+  function stopSleep() {
+    clearInterval(sleepTimer);
+    sleepTimer = null;
+    sleepEnd = 0;
+    sleepStep = -1;
+    audio.volume = 1;
+    rainAudio.volume = rainBaseVolume();
+    sleepBtn.classList.remove('active');
+    sleepLabel.textContent = 'Sleep';
+  }
+
+  function sleepTick() {
+    const left = sleepEnd - Date.now();
+    if (left <= 0) {
+      audio.pause();
+      if (rainOn) setRain(false);
+      stopSleep();
+      showToast('Sleep timer done');
+      return;
+    }
+    const f = left < SLEEP_FADE_MS ? left / SLEEP_FADE_MS : 1;
+    audio.volume = f;
+    rainAudio.volume = rainBaseVolume() * f;
+    const s = Math.ceil(left / 1000);
+    sleepLabel.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  sleepBtn.addEventListener('click', () => {
+    sleepStep++;
+    if (sleepStep >= SLEEP_STEPS.length) {
+      stopSleep();
+      showToast('Sleep timer off');
+      return;
+    }
+    clearInterval(sleepTimer);
+    sleepEnd = Date.now() + SLEEP_STEPS[sleepStep] * 60000;
+    sleepTimer = setInterval(sleepTick, 250);
+    sleepBtn.classList.add('active');
+    sleepTick();
+    showToast('Sleep in ' + SLEEP_STEPS[sleepStep] + ' min');
+  });
+
   // ---------- Storage usage ----------
 
   function fmtBytes(bytes) {
@@ -168,9 +226,19 @@
     showToast._t = setTimeout(() => toastEl.classList.remove('show'), 1800);
   }
 
+  // Special view id for the automatic Favorites list (can't clash with a
+  // playlist name a user would type).
+  const FAV = '__favorites__';
+  function isLibLike() { return activeView === 'library' || activeView === FAV; }
+  function viewLabel() {
+    return activeView === 'library' ? 'Library' : activeView === FAV ? 'Favorites' : activeView;
+  }
+
   function currentList() {
     const base = activeView === 'library'
       ? library
+      : activeView === FAV
+      ? library.filter((t) => t.fav)
       : (playlists[activeView] || []).map((id) => library.find((t) => t.id === id)).filter(Boolean);
 
     let list = base;
@@ -292,7 +360,7 @@
       const art = await extractCoverArt(t.blob);
       t.artChecked = true;
       if (art) { t.art = art; t.artUrl = URL.createObjectURL(art); }
-      await DB.updateTrack({ id: t.id, name: t.name, blob: t.blob, title: t.title, duration: t.duration, addedAt: t.addedAt, art: t.art || null, artChecked: true });
+      await DB.updateTrack({ id: t.id, name: t.name, blob: t.blob, title: t.title, duration: t.duration, addedAt: t.addedAt, art: t.art || null, artChecked: true, fav: !!t.fav });
       if (art) render();
     }
   }
@@ -316,21 +384,21 @@
     const url = URL.createObjectURL(blob);
     const title = filename.replace(/\.[^/.]+$/, '');
     const addedAt = Date.now();
-    const track = { id, name: filename, blob, url, title, duration: null, addedAt, art: null, artUrl: null, artChecked: false };
+    const track = { id, name: filename, blob, url, title, duration: null, addedAt, art: null, artUrl: null, artChecked: false, fav: false };
     library.push(track);
-    await DB.addTrack({ id, name: filename, blob, title, duration: null, addedAt, art: null, artChecked: false });
+    await DB.addTrack({ id, name: filename, blob, title, duration: null, addedAt, art: null, artChecked: false, fav: false });
 
     const probe = new Audio(url);
     probe.addEventListener('loadedmetadata', () => {
       track.duration = probe.duration;
-      DB.updateTrack({ id, name: filename, blob, title, duration: probe.duration, addedAt, art: track.art, artChecked: track.artChecked });
+      DB.updateTrack({ id, name: filename, blob, title, duration: probe.duration, addedAt, art: track.art, artChecked: track.artChecked, fav: !!track.fav });
       render();
     });
 
     extractCoverArt(blob).then((art) => {
       track.artChecked = true;
       if (art) { track.art = art; track.artUrl = URL.createObjectURL(art); }
-      DB.updateTrack({ id, name: filename, blob, title, duration: track.duration, addedAt, art: track.art, artChecked: true });
+      DB.updateTrack({ id, name: filename, blob, title, duration: track.duration, addedAt, art: track.art, artChecked: true, fav: !!track.fav });
       if (art) {
         render();
         if (currentId === id) updateMediaSession(track); // refresh lock-screen art if it's playing already
@@ -379,10 +447,19 @@
     const title = next.trim();
     if (!title || title === track.title) return;
     track.title = title;
-    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title, duration: track.duration, addedAt: track.addedAt, art: track.art || null, artChecked: !!track.artChecked });
+    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title, duration: track.duration, addedAt: track.addedAt, art: track.art || null, artChecked: !!track.artChecked, fav: !!track.fav });
     render();
     showToast('Renamed to "' + title + '"');
     if (currentId === id) updateMediaSession(track); // keep lock-screen title in sync
+  }
+
+  async function toggleFav(id) {
+    const track = getTrackById(id);
+    if (!track) return;
+    track.fav = !track.fav;
+    render();
+    showToast(track.fav ? 'Added to Favorites' : 'Removed from Favorites');
+    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title: track.title, duration: track.duration, addedAt: track.addedAt, art: track.art || null, artChecked: !!track.artChecked, fav: track.fav });
   }
 
   function updateFileCount() {
@@ -409,7 +486,7 @@
     const meta = {
       tracks: library.map((t) => ({
         id: t.id, title: t.title, name: t.name,
-        mime: t.blob.type || 'audio/mpeg', size: t.blob.size, duration: t.duration, addedAt: t.addedAt
+        mime: t.blob.type || 'audio/mpeg', size: t.blob.size, duration: t.duration, addedAt: t.addedAt, fav: !!t.fav
       })),
       playlists
     };
@@ -460,8 +537,8 @@
         const addedAt = t.addedAt || Date.now();
         const art = await extractCoverArt(blob);
         const artUrl = art ? URL.createObjectURL(art) : null;
-        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration, addedAt, art, artUrl, artChecked: true });
-        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration, addedAt, art, artChecked: true });
+        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration, addedAt, art, artUrl, artChecked: true, fav: !!t.fav });
+        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration, addedAt, art, artChecked: true, fav: !!t.fav });
         added++;
       }
 
@@ -760,7 +837,7 @@
     navigator.mediaSession.metadata = new MediaMetadata({
       title: track.title,
       artist: 'Your library',
-      album: activeView === 'library' ? 'Library' : activeView,
+      album: viewLabel(),
       artwork: track.artUrl ? [
         { src: track.artUrl, sizes: '512x512', type: (track.art && track.art.type) || 'image/jpeg' }
       ] : []
@@ -847,9 +924,9 @@
     const searchFocused = document.activeElement && document.activeElement.id === 'searchInput';
     const searchSel = searchFocused ? document.activeElement.selectionStart : null;
 
-    const tabsHtml = ['library', ...Object.keys(playlists)].map((name) => {
-      const label = name === 'library' ? 'Library' : escapeHtml(name);
-      const del = name !== 'library' ? `<span class="del" data-del-playlist="${escapeHtml(name)}">✕</span>` : '';
+    const tabsHtml = ['library', FAV, ...Object.keys(playlists)].map((name) => {
+      const label = name === 'library' ? 'Library' : name === FAV ? '♥ Favorites' : escapeHtml(name);
+      const del = (name !== 'library' && name !== FAV) ?`<span class="del" data-del-playlist="${escapeHtml(name)}">✕</span>` : '';
       return `<div class="tab ${activeView === name ? 'active' : ''}" data-view="${escapeHtml(name)}">${label}${del}</div>`;
     }).join('') + `<div class="tab new" id="newPlaylistTab">+ New playlist</div>`;
 
@@ -870,6 +947,8 @@
     } else if (list.length === 0) {
       listHtml = searchQuery.trim()
         ? `<div class="tracklist"><div class="empty-list">No tracks match "${escapeHtml(searchQuery.trim())}".</div></div>`
+        : activeView === FAV
+        ? `<div class="tracklist"><div class="empty-list">No favorites yet. Tap ♡ on a track to add it here.</div></div>`
         : `<div class="tracklist"><div class="empty-list">No tracks in "${escapeHtml(activeView)}" yet. Add some from your Library.</div></div>`;
     } else {
       listHtml = `<div class="tracklist">` + list.map((t, i) => {
@@ -878,13 +957,14 @@
         let actionBtn = '';
         if (!selectMode) {
           const queueBtn = `<button class="icon-btn" data-queue-add="${t.id}" title="Add to queue">Q+</button>`;
-          if (activeView === 'library') {
+          const favBtn = `<button class="icon-btn fav-btn ${t.fav ? 'on' : ''}" data-fav="${t.id}" title="${t.fav ? 'Remove from Favorites' : 'Add to Favorites'}">${t.fav ? '♥' : '♡'}</button>`;
+          if (isLibLike()) {
             const addBtn = Object.keys(playlists).length
               ? `<button class="icon-btn" data-add="${t.id}" title="Add to playlist">＋</button>`
               : '';
-            actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + queueBtn + addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
+            actionBtn = favBtn + `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + queueBtn + addBtn + `<button class="icon-btn" data-delete="${t.id}" title="Delete from library">🗑</button>`;
           } else {
-            actionBtn = `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + queueBtn + `<button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
+            actionBtn = favBtn + `<button class="icon-btn" data-rename="${t.id}" title="Rename">✎</button>` + queueBtn + `<button class="icon-btn" data-remove-from="${t.id}" title="Remove from playlist">✕</button>`;
           }
         }
         const eq = (isPl && isPlaying) ? '<span class="eq"><span></span><span></span><span></span></span>' : '';
@@ -921,11 +1001,11 @@
     let toolbarRow;
     if (selectMode) {
       const allVisibleSelected = list.length > 0 && list.every((t) => selectedIds.has(t.id));
-      const addAction = (activeView === 'library' && Object.keys(playlists).length)
+      const addAction = (isLibLike() && Object.keys(playlists).length)
         ? `<button class="btn btn-ghost sm" id="bulkAddBtn">＋ Add to playlist</button>` : '';
-      const removeAction = activeView !== 'library'
+      const removeAction = !isLibLike()
         ? `<button class="btn btn-ghost sm" id="bulkRemoveBtn">✕ Remove from playlist</button>` : '';
-      const deleteAction = activeView === 'library'
+      const deleteAction = isLibLike()
         ? `<button class="btn btn-ghost sm danger" id="bulkDeleteBtn">🗑 Delete</button>` : '';
       toolbarRow = `
         <div class="bulk-bar">
@@ -948,7 +1028,7 @@
     const header = library.length ? `
       <div class="tabs">${tabsHtml}</div>
       ${newPlaylistForm}
-      <div class="section-label">${activeView === 'library' ? 'Your library' : escapeHtml(activeView)}</div>
+      <div class="section-label">${activeView === 'library' ? 'Your library' : escapeHtml(viewLabel())}</div>
       ${searchSortRow}
       ${toolbarRow}
     ` : '';
@@ -1000,7 +1080,7 @@
     });
     content.querySelectorAll('[data-play]').forEach((el) => {
       el.addEventListener('click', (e) => {
-        if (e.target.closest('[data-add],[data-remove-from],[data-delete],[data-rename],[data-queue-add]')) return;
+        if (e.target.closest('[data-add],[data-remove-from],[data-delete],[data-rename],[data-queue-add],[data-fav]')) return;
         if (selectMode) { toggleSelect(el.dataset.play); return; }
         playTrack(el.dataset.play);
       });
@@ -1013,6 +1093,9 @@
     });
     content.querySelectorAll('[data-rename]').forEach((el) => {
       el.addEventListener('click', (e) => { e.stopPropagation(); renameTrack(el.dataset.rename); });
+    });
+    content.querySelectorAll('[data-fav]').forEach((el) => {
+      el.addEventListener('click', (e) => { e.stopPropagation(); toggleFav(el.dataset.fav); });
     });
     content.querySelectorAll('[data-queue-add]').forEach((el) => {
       el.addEventListener('click', (e) => { e.stopPropagation(); addToQueue(el.dataset.queueAdd); });
@@ -1081,6 +1164,9 @@
             ? `<img class="np-art" src="${track.artUrl}" alt="" />`
             : `<span class="np-art np-art-mono" style="background:${monoColor(track.title)}">${monoLetter(track.title)}</span>`}
           <div class="np-track">${escapeHtml(track.title)}</div>
+          <button class="np-queue-btn np-fav-btn ${track.fav ? 'on' : ''}" id="npFavBtn" title="${track.fav ? 'Remove from Favorites' : 'Add to Favorites'}">
+            <svg viewBox="0 0 24 24" fill="${track.fav ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 21s-7.5-4.6-9.5-9.2C1.2 8.6 3 5 6.5 5c2 0 3.6 1.1 5.5 3 1.9-1.9 3.5-3 5.5-3C21 5 22.8 8.6 21.5 11.8 19.5 16.4 12 21 12 21z"/></svg>
+          </button>
           <button class="np-queue-btn" id="queueToggleBtn" title="Up next">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h11"/></svg>
             ${queue.length ? `<span class="queue-badge">${queue.length}</span>` : ''}
@@ -1115,6 +1201,7 @@
     document.getElementById('shuffleBtn').addEventListener('click', toggleShuffle);
     document.getElementById('repeatBtn').addEventListener('click', cycleRepeat);
     document.getElementById('queueToggleBtn').addEventListener('click', toggleQueuePanel);
+    document.getElementById('npFavBtn').addEventListener('click', () => toggleFav(track.id));
   }
 
   // ---------- Queue panel (up next) ----------
