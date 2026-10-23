@@ -44,7 +44,7 @@ body{
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  padding: 20px 18px 150px;
+  padding: 20px 18px 100px;
 }
 
 header{
@@ -513,27 +513,6 @@ input[type=range]::-webkit-slider-thumb{
   justify-content:center;
 }
 .np-controls .toggle.on{ color: var(--amber); }
-.np-extra{
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  gap: 10px;
-  margin-top: 8px;
-}
-.np-extra button{
-  background:none;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--muted);
-  font-family:'JetBrains Mono', monospace;
-  font-size: 10.5px;
-  letter-spacing: 0.04em;
-  padding: 4px 10px;
-  cursor:pointer;
-  white-space: nowrap;
-}
-.np-extra button:hover{ color: var(--text); }
-.np-extra button.on{ color: var(--amber); border-color: var(--amber); }
 .np-controls .play-btn{
   width: 46px; height:46px;
   border-radius:50%;
