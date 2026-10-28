@@ -689,3 +689,52 @@ input[type=range]::-webkit-slider-thumb{
   color: var(--text);
 }
 .backup-banner span{ flex: 1 1 200px; }
+
+/* ---- Recent / Most played ---- */
+.plays{
+  font-family:'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--amber);
+  flex-shrink:0;
+}
+
+/* ---- Drag to reorder (handle-only) ---- */
+.drag-handle{
+  cursor: grab;
+  touch-action: none;       /* only the grip captures touch; the rest of the list scrolls normally */
+  user-select: none;
+  -webkit-user-select: none;
+  flex-shrink: 0;
+  padding: 8px 8px;
+  margin-left: -6px;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--muted);
+}
+.drag-handle:active{ cursor: grabbing; color: var(--amber); }
+.sorting .track, .sorting .queue-item{ transition: transform 0.15s ease; }
+.sorting .dragging{
+  transition: none !important;
+  position: relative;
+  z-index: 5;
+  background: var(--surface-2);
+  box-shadow: 0 8px 22px rgba(0,0,0,0.35);
+}
+.bulk-bar .btn:disabled{ opacity: 0.45; cursor: default; }
+
+/* ---- Mini player (collapsed now-playing bar) ---- */
+.np-mini-play{ display: none; }
+.np-mini-play svg{ width: 22px; height: 22px; }
+.np-collapse-btn svg{ width: 19px; height: 19px; transition: transform 0.2s ease; }
+.now-playing.collapsed .np-collapse-btn svg{ transform: rotate(180deg); }
+.now-playing.collapsed .np-mini-play{ display: flex; color: var(--amber); }
+.now-playing.collapsed .np-wave,
+.now-playing.collapsed .np-progress,
+.now-playing.collapsed .np-controls,
+.now-playing.collapsed .np-extra{ display: none; }
+.now-playing.collapsed .np-header{ margin-bottom: 0; }
+.now-playing.collapsed .np-track{ cursor: pointer; }
+.np-mini-bar{ display: none; height: 2px; margin-top: 8px; background: var(--line); border-radius: 2px; overflow: hidden; }
+.np-mini-bar span{ display: block; height: 100%; width: 0; background: var(--amber); }
+.now-playing.collapsed .np-mini-bar{ display: block; }
+body.np-collapsed .app{ padding-bottom: 90px; }
