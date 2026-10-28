@@ -129,6 +129,31 @@
     // is not auto-resumed; the user taps Rain to start it each session.
   })();
 
+  // ---------- Music volume ----------
+  // In-app volume for the music (the rain has its own slider). Many phones
+  // handle volume in hardware, and iOS ignores audio.volume entirely, so the
+  // slider is only shown where setting the volume actually works.
+
+  let musicVolume = 1;
+  const supportsVolume = (() => {
+    try { const v = audio.volume; audio.volume = 0.5; const ok = audio.volume === 0.5; audio.volume = v; return ok; }
+    catch (e) { return false; }
+  })();
+  try {
+    const v = parseFloat(localStorage.getItem('mattmusic-vol'));
+    if (!isNaN(v)) musicVolume = Math.min(1, Math.max(0, v));
+  } catch (e) { /* ignore */ }
+  if (supportsVolume) audio.volume = musicVolume;
+
+  function setMusicVolume(v, announce) {
+    musicVolume = Math.min(1, Math.max(0, v));
+    if (supportsVolume) audio.volume = musicVolume; // a running sleep fade re-applies its factor on the next tick
+    const slider = document.getElementById('musicVol');
+    if (slider) slider.value = Math.round(musicVolume * 100);
+    try { localStorage.setItem('mattmusic-vol', String(musicVolume)); } catch (e) { /* ignore */ }
+    if (announce) showToast('Volume ' + Math.round(musicVolume * 100) + '%');
+  }
+
   // ---------- Sleep timer ----------
   // Tap the Sleep button to cycle 15 → 30 → 60 min → off. For the last 20 s
   // the music and rain fade out together, then both are paused. Uses the
@@ -150,7 +175,7 @@
     sleepTimer = null;
     sleepEnd = 0;
     sleepStep = -1;
-    audio.volume = 1;
+    if (supportsVolume) audio.volume = musicVolume;
     rainAudio.volume = rainBaseVolume();
     sleepBtn.classList.remove('active');
     sleepLabel.textContent = 'Sleep';
@@ -166,7 +191,7 @@
       return;
     }
     const f = left < SLEEP_FADE_MS ? left / SLEEP_FADE_MS : 1;
-    audio.volume = f;
+    if (supportsVolume) audio.volume = musicVolume * f;
     rainAudio.volume = rainBaseVolume() * f;
     const s = Math.ceil(left / 1000);
     sleepLabel.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
@@ -339,19 +364,29 @@
   // ---------- Loading & persistence ----------
 
   async function bootstrap() {
-    const stored = await DB.getAllTracks();
-    stored.forEach((t) => {
-      t.url = URL.createObjectURL(t.blob);
-      t.addedAt = t.addedAt || 0; // tracks saved before this field existed
-      t.artUrl = t.art ? URL.createObjectURL(t.art) : null;
-      library.push(t);
-    });
-    const storedPlaylists = await DB.getAllPlaylists();
-    storedPlaylists.forEach((p) => { playlists[p.name] = p.trackIds; });
+    try {
+      const stored = await DB.getAllTracks();
+      stored.forEach((t) => {
+        t.url = URL.createObjectURL(t.blob);
+        t.addedAt = t.addedAt || 0; // tracks saved before this field existed
+        t.artUrl = t.art ? URL.createObjectURL(t.art) : null;
+        library.push(t);
+      });
+      const storedPlaylists = await DB.getAllPlaylists();
+      storedPlaylists.forEach((p) => { playlists[p.name] = p.trackIds; });
 
-    updateFileCount();
-    render();
-    backfillArt(); // fetch cover art for tracks added before this feature existed
+      updateFileCount();
+      render();
+      backfillArt(); // fetch cover art for tracks added before this feature existed
+    } catch (err) {
+      // Show the real reason on screen instead of a blank page.
+      content.innerHTML = '<div class="empty-list">Could not load your library: ' + escapeHtml(String((err && err.message) || err)) + '</div>';
+      return;
+    }
+    // Ask the browser not to evict our storage when the phone runs low on space.
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* ignore */ }
+    // Resuming the last track is a bonus: it must never be able to block the library.
+    try { restoreResume(); render(); } catch (err) { console.error('resume failed', err); }
   }
 
   async function backfillArt() {
@@ -508,6 +543,37 @@
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
     showToast('Exported ' + library.length + ' track' + (library.length === 1 ? '' : 's'));
+    try {
+      localStorage.setItem('mattmusic-last-export', String(Date.now()));
+      localStorage.setItem('mattmusic-export-count', String(library.length));
+      localStorage.removeItem('mattmusic-backup-snooze');
+    } catch (e) { /* ignore */ }
+    render();
+  }
+
+  // Backup reminder: songs live only in this browser's storage, so nudge
+  // the user to export when they never have, it's been a while, or a bunch
+  // of new tracks were added since the last export.
+  const BACKUP_DAYS = 14;
+  const BACKUP_NEW_TRACKS = 5;
+  const SNOOZE_DAYS = 3;
+  const DAY_MS = 86400000;
+
+  function backupMessage() {
+    if (!library.length) return null;
+    let last = 0, count = 0, snooze = 0;
+    try {
+      last = parseInt(localStorage.getItem('mattmusic-last-export'), 10) || 0;
+      count = parseInt(localStorage.getItem('mattmusic-export-count'), 10) || 0;
+      snooze = parseInt(localStorage.getItem('mattmusic-backup-snooze'), 10) || 0;
+    } catch (e) { /* ignore */ }
+    if (snooze > Date.now()) return null;
+    if (!last) return 'Your songs only live on this device. Export a backup so you can never lose them.';
+    const days = Math.floor((Date.now() - last) / DAY_MS);
+    if (days >= BACKUP_DAYS) return 'Last backup: ' + days + ' days ago.';
+    const added = library.length - count;
+    if (added >= BACKUP_NEW_TRACKS) return added + ' new tracks since your last backup.';
+    return null;
   }
 
   async function importLibraryFile(file) {
@@ -575,11 +641,143 @@
     input.click();
   }
 
+  // ---------- Resume where you left off ----------
+  // Remembers the current track + position in localStorage and reloads it
+  // (paused) on the next launch. Browsers block autoplay, so you press play.
+
+  const RESUME_KEY = 'mattmusic-resume';
+  let resumeHandler = null;   // pending loadedmetadata listener from restoreResume
+  let lastResumeSave = 0;
+
+  function saveResume(t) {
+    if (!currentId || resumeHandler) return; // don't overwrite the saved spot before it's restored
+    try { localStorage.setItem(RESUME_KEY, JSON.stringify({ id: currentId, t: t || 0 })); } catch (e) { /* storage may be unavailable */ }
+  }
+
+  function cancelResume() {
+    if (resumeHandler) { audio.removeEventListener('loadedmetadata', resumeHandler); resumeHandler = null; }
+  }
+
+  function restoreResume() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(RESUME_KEY) || 'null'); } catch (e) { /* ignore */ }
+    if (!saved) return;
+    const track = getTrackById(saved.id);
+    if (!track) return;
+    let t = Number(saved.t) || 0;
+    if (track.duration && t > track.duration - 3) t = 0; // it had basically finished
+    currentId = track.id;
+    audio.src = track.url;
+    resumeHandler = () => {
+      resumeHandler = null;
+      if (t > 0) audio.currentTime = t;
+      renderProgressOnly();
+    };
+    audio.addEventListener('loadedmetadata', resumeHandler, { once: true });
+    updateMediaSession(track);
+  }
+
+  audio.addEventListener('timeupdate', () => {
+    const now = Date.now();
+    if (now - lastResumeSave > 2000) { lastResumeSave = now; saveResume(audio.currentTime); }
+  });
+  audio.addEventListener('pause', () => saveResume(audio.currentTime));
+  document.addEventListener('visibilitychange', () => { if (document.hidden) saveResume(audio.currentTime); });
+  window.addEventListener('pagehide', () => saveResume(audio.currentTime));
+
+  // ---------- Skip ±10 s and A–B loop ----------
+
+  let loopA = null;
+  let loopB = null;
+  let loopTimer = null;
+
+  function skipBy(sec) {
+    if (!currentId) return;
+    const d = isFinite(audio.duration) ? audio.duration : Infinity;
+    audio.currentTime = Math.max(0, Math.min(d - 0.1, audio.currentTime + sec));
+    renderProgressOnly();
+  }
+
+  function loopCheck() {
+    if (loopA != null && loopB != null && audio.currentTime >= loopB) audio.currentTime = loopA;
+  }
+
+  function clearLoop() {
+    loopA = null; loopB = null;
+    clearInterval(loopTimer); loopTimer = null;
+  }
+
+  function loopLabel() {
+    if (loopA == null) return 'A–B';
+    if (loopB == null) return 'A ' + fmtTime(loopA) + ' → B?';
+    return fmtTime(loopA) + '–' + fmtTime(loopB);
+  }
+
+  // Tap 1 sets A, tap 2 sets B and starts looping, tap 3 clears.
+  function cycleLoop() {
+    if (!currentId) return;
+    if (loopA == null) {
+      loopA = audio.currentTime;
+      showToast('Loop start set');
+    } else if (loopB == null) {
+      if (audio.currentTime - loopA < 0.5) { showToast('Pick B a bit later than A'); return; }
+      loopB = audio.currentTime;
+      loopTimer = setInterval(loopCheck, 80);
+      audio.currentTime = loopA;
+      showToast('Looping A–B');
+    } else {
+      clearLoop();
+      showToast('Loop cleared');
+    }
+    const btn = document.getElementById('loopBtn');
+    if (btn) { btn.textContent = loopLabel(); btn.classList.toggle('on', loopA != null); }
+  }
+
+  // ---------- Keyboard shortcuts (desktop) ----------
+  //   Space / K  play-pause      ← →  seek 5 s        J L  seek 10 s
+  //   ↑ ↓  volume                N P  next / previous  M    mute
+  //   F  favorite                R    rain on/off      S    shuffle
+  //   A  A–B loop (set A, set B, clear)
+
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const el = e.target;
+    const tag = el && el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (el && el.isContentEditable)) return;
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    let handled = true;
+    switch (k) {
+      case ' ': case 'k': togglePlay(); break;
+      case 'ArrowLeft': skipBy(-5); break;
+      case 'ArrowRight': skipBy(5); break;
+      case 'j': skipBy(-10); break;
+      case 'l': skipBy(10); break;
+      case 'ArrowUp': setMusicVolume(musicVolume + 0.05, true); break;
+      case 'ArrowDown': setMusicVolume(musicVolume - 0.05, true); break;
+      case 'n': nextTrack(false); break;
+      case 'p': prevTrack(); break;
+      case 'm': audio.muted = !audio.muted; showToast(audio.muted ? 'Muted' : 'Unmuted'); break;
+      case 'f': if (currentId) toggleFav(currentId); break;
+      case 'r': setRain(!rainOn); break;
+      case 's': toggleShuffle(); break;
+      case 'a': cycleLoop(); break;
+      default: handled = false;
+    }
+    if (handled) e.preventDefault();
+  });
+  // A focused button would otherwise also "click" on Space release.
+  document.addEventListener('keyup', (e) => {
+    if (e.key === ' ' && e.target && e.target.tagName === 'BUTTON') e.preventDefault();
+  });
+
   function playTrack(id) {
     const track = getTrackById(id);
     if (!track) return;
     ensureAudioGraph();
+    cancelResume();
+    clearLoop();
     currentId = id;
+    saveResume(0);
     audio.src = track.url;
     audio.play().then(() => { isPlaying = true; render(); }).catch(() => { isPlaying = false; render(); });
     updateMediaSession(track);
@@ -1025,7 +1223,16 @@
         </div>`;
     }
 
+    const backupMsg = backupMessage();
+    const backupBanner = backupMsg ? `
+      <div class="backup-banner">
+        <span>${escapeHtml(backupMsg)}</span>
+        <button class="btn btn-primary sm" id="backupNowBtn">Export now</button>
+        <button class="btn btn-ghost sm" id="backupLaterBtn">Later</button>
+      </div>` : '';
+
     const header = library.length ? `
+      ${backupBanner}
       <div class="tabs">${tabsHtml}</div>
       ${newPlaylistForm}
       <div class="section-label">${activeView === 'library' ? 'Your library' : escapeHtml(viewLabel())}</div>
@@ -1040,6 +1247,11 @@
     document.getElementById('loadFolderBtn')?.addEventListener('click', triggerFolderPicker);
     document.getElementById('loadFolderBtnEmpty')?.addEventListener('click', triggerFolderPicker);
     document.getElementById('exportBtn')?.addEventListener('click', exportLibrary);
+    document.getElementById('backupNowBtn')?.addEventListener('click', exportLibrary);
+    document.getElementById('backupLaterBtn')?.addEventListener('click', () => {
+      try { localStorage.setItem('mattmusic-backup-snooze', String(Date.now() + SNOOZE_DAYS * DAY_MS)); } catch (e) { /* ignore */ }
+      render();
+    });
     document.getElementById('importBtn')?.addEventListener('click', triggerImportPicker);
     document.getElementById('importBtnEmpty')?.addEventListener('click', triggerImportPicker);
     document.getElementById('newPlaylistTab')?.addEventListener('click', () => {
@@ -1189,6 +1401,15 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 2l4 4-4 4M3 11V9a4 4 0 014-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 01-4 4H3"/>${repeatMode === 'one' ? '<text x="9" y="15.5" font-size="7" fill="currentColor" stroke="none">1</text>' : ''}</svg>
           </button>
         </div>
+        <div class="np-extra">
+          <button id="back10Btn" title="Back 10 seconds">−10s</button>
+          <button id="loopBtn" class="${loopA != null ? 'on' : ''}" title="A–B loop: tap to set A, again for B, again to clear">${loopLabel()}</button>
+          <button id="fwd10Btn" title="Forward 10 seconds">+10s</button>
+          ${supportsVolume ? `<span class="np-vol" title="Music volume">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>
+            <input type="range" id="musicVol" min="0" max="100" value="${Math.round(musicVolume * 100)}" aria-label="Music volume">
+          </span>` : ''}
+        </div>
       </div>`;
 
     const seek = document.getElementById('seek');
@@ -1202,6 +1423,10 @@
     document.getElementById('repeatBtn').addEventListener('click', cycleRepeat);
     document.getElementById('queueToggleBtn').addEventListener('click', toggleQueuePanel);
     document.getElementById('npFavBtn').addEventListener('click', () => toggleFav(track.id));
+    document.getElementById('back10Btn').addEventListener('click', () => skipBy(-10));
+    document.getElementById('fwd10Btn').addEventListener('click', () => skipBy(10));
+    document.getElementById('loopBtn').addEventListener('click', cycleLoop);
+    document.getElementById('musicVol')?.addEventListener('input', (e) => setMusicVolume(e.target.value / 100));
   }
 
   // ---------- Queue panel (up next) ----------
