@@ -254,27 +254,64 @@
   // Special view id for the automatic Favorites list (can't clash with a
   // playlist name a user would type).
   const FAV = '__favorites__';
-  function isLibLike() { return activeView === 'library' || activeView === FAV; }
+  const RECENT = '__recent__';
+  const MOST = '__most__';
+  const SPECIAL_VIEWS = [FAV, RECENT, MOST];
+  function isSpecialView(v) { return SPECIAL_VIEWS.includes(v); }
+  function isLibLike() { return activeView === 'library' || isSpecialView(activeView); }
+  function isAutoView() { return activeView === RECENT || activeView === MOST; }
   function viewLabel() {
-    return activeView === 'library' ? 'Library' : activeView === FAV ? 'Favorites' : activeView;
+    return activeView === 'library' ? 'Library'
+      : activeView === FAV ? 'Favorites'
+      : activeView === RECENT ? 'Recently played'
+      : activeView === MOST ? 'Most played'
+      : activeView;
   }
 
+  // Recent / Most played are ordered once, when you open the tab, and then
+  // stay put — so the list doesn't reshuffle under you (and "next" doesn't
+  // jump around) while a track you're listening to racks up a play.
+  const autoOrder = {};
+  function buildAutoOrder(view) {
+    const arr = library.filter((t) => (t.plays || 0) > 0);
+    if (view === RECENT) arr.sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
+    else arr.sort((a, b) => (b.plays || 0) - (a.plays || 0) || (b.lastPlayed || 0) - (a.lastPlayed || 0));
+    return arr.slice(0, 50).map((t) => t.id);
+  }
+
+  // Reorder mode (playlists only): drag handles appear, everything else is inert.
+  let reorderMode = false;
+  let reorderUndo = [];
+
   function currentList() {
+    const q = searchQuery.trim().toLowerCase();
+
+    if (isAutoView()) {
+      if (!autoOrder[activeView]) autoOrder[activeView] = buildAutoOrder(activeView);
+      let l = autoOrder[activeView].map((id) => library.find((t) => t.id === id)).filter(Boolean);
+      if (q) l = l.filter((t) => t.title.toLowerCase().includes(q));
+      return l;
+    }
+
     const base = activeView === 'library'
       ? library
       : activeView === FAV
       ? library.filter((t) => t.fav)
       : (playlists[activeView] || []).map((id) => library.find((t) => t.id === id)).filter(Boolean);
 
-    let list = base;
-    const q = searchQuery.trim().toLowerCase();
-    if (q) list = list.filter((t) => t.title.toLowerCase().includes(q));
+    // In a playlist, "Playlist order" (and reorder mode) shows the saved manual order.
+    const manual = !isLibLike() && (reorderMode || sortMode === 'manual');
 
-    list = list.slice().sort((a, b) => {
-      if (sortMode === 'alpha') return a.title.localeCompare(b.title);
-      if (sortMode === 'duration') return (a.duration || 0) - (b.duration || 0);
-      return (b.addedAt || 0) - (a.addedAt || 0); // recently added first
-    });
+    let list = base;
+    if (q && !reorderMode) list = list.filter((t) => t.title.toLowerCase().includes(q));
+
+    if (!manual) {
+      list = list.slice().sort((a, b) => {
+        if (sortMode === 'alpha') return a.title.localeCompare(b.title);
+        if (sortMode === 'duration') return (a.duration || 0) - (b.duration || 0);
+        return (b.addedAt || 0) - (a.addedAt || 0); // recently added first
+      });
+    }
 
     return list;
   }
@@ -389,13 +426,23 @@
     try { restoreResume(); render(); } catch (err) { console.error('resume failed', err); }
   }
 
+  // One place that decides what a stored track record contains.
+  function trackRecord(t) {
+    return {
+      id: t.id, name: t.name, blob: t.blob, title: t.title, duration: t.duration, addedAt: t.addedAt,
+      art: t.art || null, artChecked: !!t.artChecked, fav: !!t.fav,
+      plays: t.plays || 0, lastPlayed: t.lastPlayed || 0
+    };
+  }
+  function persistTrack(t) { return DB.updateTrack(trackRecord(t)); }
+
   async function backfillArt() {
     for (const t of library) {
       if (t.artChecked) continue;
       const art = await extractCoverArt(t.blob);
       t.artChecked = true;
       if (art) { t.art = art; t.artUrl = URL.createObjectURL(art); }
-      await DB.updateTrack({ id: t.id, name: t.name, blob: t.blob, title: t.title, duration: t.duration, addedAt: t.addedAt, art: t.art || null, artChecked: true, fav: !!t.fav });
+      await persistTrack(t);
       if (art) render();
     }
   }
@@ -426,14 +473,14 @@
     const probe = new Audio(url);
     probe.addEventListener('loadedmetadata', () => {
       track.duration = probe.duration;
-      DB.updateTrack({ id, name: filename, blob, title, duration: probe.duration, addedAt, art: track.art, artChecked: track.artChecked, fav: !!track.fav });
+      persistTrack(track);
       render();
     });
 
     extractCoverArt(blob).then((art) => {
       track.artChecked = true;
       if (art) { track.art = art; track.artUrl = URL.createObjectURL(art); }
-      DB.updateTrack({ id, name: filename, blob, title, duration: track.duration, addedAt, art: track.art, artChecked: true, fav: !!track.fav });
+      persistTrack(track);
       if (art) {
         render();
         if (currentId === id) updateMediaSession(track); // refresh lock-screen art if it's playing already
@@ -482,7 +529,7 @@
     const title = next.trim();
     if (!title || title === track.title) return;
     track.title = title;
-    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title, duration: track.duration, addedAt: track.addedAt, art: track.art || null, artChecked: !!track.artChecked, fav: !!track.fav });
+    await persistTrack(track);
     render();
     showToast('Renamed to "' + title + '"');
     if (currentId === id) updateMediaSession(track); // keep lock-screen title in sync
@@ -494,7 +541,7 @@
     track.fav = !track.fav;
     render();
     showToast(track.fav ? 'Added to Favorites' : 'Removed from Favorites');
-    await DB.updateTrack({ id: track.id, name: track.name, blob: track.blob, title: track.title, duration: track.duration, addedAt: track.addedAt, art: track.art || null, artChecked: !!track.artChecked, fav: track.fav });
+    await persistTrack(track);
   }
 
   function updateFileCount() {
@@ -521,7 +568,8 @@
     const meta = {
       tracks: library.map((t) => ({
         id: t.id, title: t.title, name: t.name,
-        mime: t.blob.type || 'audio/mpeg', size: t.blob.size, duration: t.duration, addedAt: t.addedAt, fav: !!t.fav
+        mime: t.blob.type || 'audio/mpeg', size: t.blob.size, duration: t.duration, addedAt: t.addedAt, fav: !!t.fav,
+        plays: t.plays || 0, lastPlayed: t.lastPlayed || 0
       })),
       playlists
     };
@@ -603,8 +651,8 @@
         const addedAt = t.addedAt || Date.now();
         const art = await extractCoverArt(blob);
         const artUrl = art ? URL.createObjectURL(art) : null;
-        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration, addedAt, art, artUrl, artChecked: true, fav: !!t.fav });
-        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration, addedAt, art, artChecked: true, fav: !!t.fav });
+        library.push({ id: newId, name: t.name, blob, url, title: t.title, duration: t.duration, addedAt, art, artUrl, artChecked: true, fav: !!t.fav, plays: t.plays || 0, lastPlayed: t.lastPlayed || 0 });
+        await DB.addTrack({ id: newId, name: t.name, blob, title: t.title, duration: t.duration, addedAt, art, artChecked: true, fav: !!t.fav, plays: t.plays || 0, lastPlayed: t.lastPlayed || 0 });
         added++;
       }
 
@@ -682,6 +730,30 @@
     if (now - lastResumeSave > 2000) { lastResumeSave = now; saveResume(audio.currentTime); }
   });
   audio.addEventListener('pause', () => saveResume(audio.currentTime));
+
+  // ---------- Play counts (feeds Recent / Most played) ----------
+  // A play counts after ~30 s of real listening (or half of a short track).
+  // Seeking ahead doesn't count: only natural playback progress is added up.
+  const PLAY_COUNT_SECS = 30;
+  let listened = 0;
+  let lastT = 0;
+  let playCounted = false;
+
+  audio.addEventListener('timeupdate', () => {
+    const t = audio.currentTime;
+    const delta = t - lastT;
+    lastT = t;
+    if (playCounted || !currentId || audio.paused) return;
+    if (delta > 0 && delta < 1.5) listened += delta;
+    const d = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+    if (listened < (d ? Math.min(PLAY_COUNT_SECS, d * 0.5) : PLAY_COUNT_SECS)) return;
+    const track = getTrackById(currentId);
+    if (!track) return;
+    playCounted = true;
+    track.plays = (track.plays || 0) + 1;
+    track.lastPlayed = Date.now();
+    persistTrack(track);
+  });
   document.addEventListener('visibilitychange', () => { if (document.hidden) saveResume(audio.currentTime); });
   window.addEventListener('pagehide', () => saveResume(audio.currentTime));
 
@@ -776,6 +848,7 @@
     ensureAudioGraph();
     cancelResume();
     clearLoop();
+    listened = 0; lastT = 0; playCounted = false;
     currentId = id;
     saveResume(0);
     audio.src = track.url;
@@ -857,6 +930,136 @@
   function removeFromQueue(index) {
     queue.splice(index, 1);
     render();
+  }
+
+  // ---------- Drag to reorder ----------
+  // Handle-only: a drag starts only from the ⠿ grip (touch-action is disabled
+  // on the grip alone, so scrolling the list never moves anything). A plain
+  // tap on the grip changes nothing; the row has to actually land elsewhere.
+
+  function enableDragSort(container, itemSel, handleSel, onMove, autoScroll) {
+    if (!container) return;
+    container.querySelectorAll(handleSel).forEach((handle) => {
+      handle.addEventListener('pointerdown', (e) => {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        const items = Array.from(container.querySelectorAll(itemSel));
+        const item = handle.closest(itemSel);
+        const from = items.indexOf(item);
+        if (from < 0 || items.length < 2) return;
+        e.preventDefault();
+
+        const sy = () => (autoScroll ? window.scrollY : 0);
+        const rects = items.map((el) => {
+          const r = el.getBoundingClientRect();
+          return { top: r.top + sy(), h: r.height };
+        });
+        const mids = rects.map((r) => r.top + r.h / 2);
+        const startY = e.clientY + sy();
+        let lastClientY = e.clientY;
+        let to = from;
+        let raf = 0;
+
+        handle.setPointerCapture(e.pointerId);
+        container.classList.add('sorting');
+        item.classList.add('dragging');
+
+        const update = () => {
+          const dy = lastClientY + sy() - startY;
+          item.style.transform = 'translateY(' + dy + 'px)';
+          const center = mids[from] + dy;
+          to = from;
+          for (let j = 0; j < from; j++) { if (center < mids[j]) { to = j; break; } }
+          for (let j = rects.length - 1; j > from; j--) { if (center > mids[j]) { to = j; break; } }
+          items.forEach((el, i) => {
+            if (i === from) return;
+            let shift = 0;
+            if (from < to && i > from && i <= to) shift = -rects[from].h;
+            else if (from > to && i >= to && i < from) shift = rects[from].h;
+            el.style.transform = shift ? 'translateY(' + shift + 'px)' : '';
+          });
+        };
+
+        const loop = () => {
+          const vh = window.innerHeight;
+          let d = 0;
+          if (lastClientY < 90) d = -Math.ceil((90 - lastClientY) / 6);
+          else if (lastClientY > vh - 170) d = Math.ceil((lastClientY - (vh - 170)) / 6);
+          if (d) { window.scrollBy(0, d); update(); }
+          raf = requestAnimationFrame(loop);
+        };
+
+        const onMoveEv = (ev) => {
+          if (ev.pointerId !== e.pointerId) return;
+          lastClientY = ev.clientY;
+          update();
+        };
+        const finish = (cancelled) => {
+          handle.removeEventListener('pointermove', onMoveEv);
+          handle.removeEventListener('pointerup', onUp);
+          handle.removeEventListener('pointercancel', onCancel);
+          cancelAnimationFrame(raf);
+          try { handle.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+          items.forEach((el) => { el.style.transform = ''; });
+          item.classList.remove('dragging');
+          container.classList.remove('sorting');
+          if (!cancelled && to !== from) onMove(from, to);
+        };
+        const onUp = () => finish(false);
+        const onCancel = () => finish(true);
+        handle.addEventListener('pointermove', onMoveEv);
+        handle.addEventListener('pointerup', onUp);
+        handle.addEventListener('pointercancel', onCancel);
+        if (autoScroll) raf = requestAnimationFrame(loop);
+      });
+    });
+  }
+
+  function moveQueueTo(from, to) {
+    if (from === to || from < 0 || to < 0 || from >= queue.length || to >= queue.length) return;
+    const [m] = queue.splice(from, 1);
+    queue.splice(to, 0, m);
+    render();
+  }
+
+  function movePlaylistTrack(from, to) {
+    const name = activeView;
+    if (!playlists[name]) return;
+    const ids = currentList().map((t) => t.id); // what's on screen, in order
+    if (from < 0 || to < 0 || from >= ids.length || to >= ids.length) return;
+    reorderUndo.push(playlists[name].slice());
+    if (reorderUndo.length > 20) reorderUndo.shift();
+    const [m] = ids.splice(from, 1);
+    ids.splice(to, 0, m);
+    playlists[name] = ids;
+    DB.savePlaylist(name, ids);
+    render();
+  }
+
+  function undoReorder() {
+    const prev = reorderUndo.pop();
+    if (!prev || !playlists[activeView]) return;
+    playlists[activeView] = prev;
+    DB.savePlaylist(activeView, prev);
+    render();
+    showToast('Undone');
+  }
+
+  async function renamePlaylist() {
+    const old = activeView;
+    if (isLibLike() || !playlists[old]) return;
+    const next = prompt('Rename playlist', old);
+    if (next == null) return;
+    const name = next.trim();
+    if (!name || name === old) return;
+    if (playlists[name] || isSpecialView(name) || name === 'library') { showToast('That name is already used'); return; }
+    const rebuilt = {};
+    Object.keys(playlists).forEach((k) => { rebuilt[k === old ? name : k] = playlists[k]; }); // keep tab order
+    playlists = rebuilt;
+    activeView = name;
+    await DB.savePlaylist(name, playlists[name]);
+    await DB.deletePlaylist(old);
+    render();
+    showToast('Renamed to "' + name + '"');
   }
 
   function moveQueueItem(index, dir) {
@@ -1071,6 +1274,11 @@
     const cur = document.getElementById('curTime');
     if (bar && !bar.dragging) bar.value = audio.currentTime || 0;
     if (cur) cur.textContent = fmtTime(audio.currentTime);
+    const fill = document.getElementById('miniFill');
+    if (fill) {
+      const d = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+      fill.style.width = d ? Math.min(100, (audio.currentTime / d) * 100) + '%' : '0%';
+    }
     if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession && isFinite(audio.duration) && audio.duration > 0) {
       try {
         navigator.mediaSession.setPositionState({
@@ -1084,6 +1292,8 @@
   function renderControlsOnly() {
     const playBtn = document.getElementById('playBtnIcon');
     if (playBtn) playBtn.innerHTML = isPlaying ? iconPause() : iconPlay();
+    const miniIcon = document.getElementById('miniPlayIcon');
+    if (miniIcon) miniIcon.innerHTML = isPlaying ? iconPause() : iconPlay();
     syncBrandMark();
   }
 
@@ -1122,9 +1332,11 @@
     const searchFocused = document.activeElement && document.activeElement.id === 'searchInput';
     const searchSel = searchFocused ? document.activeElement.selectionStart : null;
 
-    const tabsHtml = ['library', FAV, ...Object.keys(playlists)].map((name) => {
-      const label = name === 'library' ? 'Library' : name === FAV ? '♥ Favorites' : escapeHtml(name);
-      const del = (name !== 'library' && name !== FAV) ?`<span class="del" data-del-playlist="${escapeHtml(name)}">✕</span>` : '';
+    if (reorderMode && isLibLike()) reorderMode = false; // safety net after a view change
+
+    const tabsHtml = ['library', FAV, RECENT, MOST, ...Object.keys(playlists)].map((name) => {
+      const label = name === 'library' ? 'Library' : name === FAV ? '♥ Favorites' : name === RECENT ? 'Recent' : name === MOST ? 'Most played' : escapeHtml(name);
+      const del = (name !== 'library' && !isSpecialView(name)) ?`<span class="del" data-del-playlist="${escapeHtml(name)}">✕</span>` : '';
       return `<div class="tab ${activeView === name ? 'active' : ''}" data-view="${escapeHtml(name)}">${label}${del}</div>`;
     }).join('') + `<div class="tab new" id="newPlaylistTab">+ New playlist</div>`;
 
@@ -1147,13 +1359,15 @@
         ? `<div class="tracklist"><div class="empty-list">No tracks match "${escapeHtml(searchQuery.trim())}".</div></div>`
         : activeView === FAV
         ? `<div class="tracklist"><div class="empty-list">No favorites yet. Tap ♡ on a track to add it here.</div></div>`
+        : isAutoView()
+        ? `<div class="tracklist"><div class="empty-list">Nothing here yet. Tracks show up after you've listened to them for about 30 seconds.</div></div>`
         : `<div class="tracklist"><div class="empty-list">No tracks in "${escapeHtml(activeView)}" yet. Add some from your Library.</div></div>`;
     } else {
       listHtml = `<div class="tracklist">` + list.map((t, i) => {
         const isPl = t.id === currentId;
         const isSel = selectedIds.has(t.id);
         let actionBtn = '';
-        if (!selectMode) {
+        if (!selectMode && !reorderMode) {
           const queueBtn = `<button class="icon-btn" data-queue-add="${t.id}" title="Add to queue">Q+</button>`;
           const favBtn = `<button class="icon-btn fav-btn ${t.fav ? 'on' : ''}" data-fav="${t.id}" title="${t.fav ? 'Remove from Favorites' : 'Add to Favorites'}">${t.fav ? '♥' : '♡'}</button>`;
           if (isLibLike()) {
@@ -1172,8 +1386,9 @@
               ? `<img class="art-thumb" src="${t.artUrl}" alt="" />`
               : `<span class="mono" style="background:${monoColor(t.title)}">${monoLetter(t.title)}</span>`);
         return `<div class="track ${isPl ? 'playing' : ''} ${isSel ? 'selected' : ''}" data-play="${t.id}">
-          ${leading}
+          ${reorderMode ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : ''}${leading}
           <div class="meta"><div class="title">${eq}${escapeHtml(t.title)}</div></div>
+          ${activeView === MOST ? `<span class="plays">${t.plays || 0}×</span>` : ''}
           <span class="dur">${t.duration ? fmtTime(t.duration) : '--:--'}</span>
           ${actionBtn}
         </div>`;
@@ -1186,18 +1401,26 @@
         <button class="btn btn-primary" id="confirmNewPl">Create</button>
       </div>` : '';
 
-    const searchSortRow = library.length ? `
+    const searchSortRow = (library.length && !reorderMode) ? `
       <div class="search-sort-row">
         <input type="search" id="searchInput" class="search-input" placeholder="Search titles…" value="${escapeHtml(searchQuery)}" />
-        <select id="sortSelect" class="sort-select" title="Sort by">
+        ${isAutoView() ? '' : `<select id="sortSelect" class="sort-select" title="Sort by">
           <option value="added" ${sortMode === 'added' ? 'selected' : ''}>Recently added</option>
           <option value="alpha" ${sortMode === 'alpha' ? 'selected' : ''}>Title (A–Z)</option>
           <option value="duration" ${sortMode === 'duration' ? 'selected' : ''}>Duration</option>
-        </select>
+          ${!isLibLike() ? `<option value="manual" ${sortMode === 'manual' ? 'selected' : ''}>Playlist order</option>` : ''}
+        </select>`}
       </div>` : '';
 
     let toolbarRow;
-    if (selectMode) {
+    if (reorderMode) {
+      toolbarRow = `
+        <div class="bulk-bar">
+          <span class="bulk-count">Drag the ⠿ grip to reorder</span>
+          <button class="btn btn-ghost sm" id="reorderUndoBtn" ${reorderUndo.length ? '' : 'disabled'}>↶ Undo</button>
+          <button class="btn btn-primary sm" id="reorderDoneBtn">✓ Done</button>
+        </div>`;
+    } else if (selectMode) {
       const allVisibleSelected = list.length > 0 && list.every((t) => selectedIds.has(t.id));
       const addAction = (isLibLike() && Object.keys(playlists).length)
         ? `<button class="btn btn-ghost sm" id="bulkAddBtn">＋ Add to playlist</button>` : '';
@@ -1215,6 +1438,7 @@
     } else {
       toolbarRow = `
         <div class="toolbar-row">
+          ${!isLibLike() ? `<button class="btn btn-ghost sm" id="reorderBtn">⇅ Reorder</button><button class="btn btn-ghost sm" id="renamePlBtn">✎ Rename</button>` : ''}
           <button class="btn btn-ghost sm" id="loadMoreBtn">+ Add more files</button>
           <button class="btn btn-ghost sm" id="loadFolderBtn">+ Add folder</button>
           <button class="btn btn-ghost sm" id="selectModeBtn">☑ Select</button>
@@ -1281,10 +1505,24 @@
     document.getElementById('bulkRemoveBtn')?.addEventListener('click', bulkRemoveFromPlaylist);
     document.getElementById('bulkDeleteBtn')?.addEventListener('click', bulkDelete);
 
+    document.getElementById('reorderBtn')?.addEventListener('click', () => {
+      reorderMode = true; reorderUndo = []; sortMode = 'manual'; selectMode = false; selectedIds.clear(); render();
+    });
+    document.getElementById('reorderDoneBtn')?.addEventListener('click', () => {
+      reorderMode = false; reorderUndo = []; render(); showToast('Order saved');
+    });
+    document.getElementById('reorderUndoBtn')?.addEventListener('click', undoReorder);
+    document.getElementById('renamePlBtn')?.addEventListener('click', renamePlaylist);
+    if (reorderMode) enableDragSort(content, '.tracklist .track', '.drag-handle', movePlaylistTrack, true);
+
     content.querySelectorAll('[data-view]').forEach((el) => {
       el.addEventListener('click', (e) => {
         if (e.target.closest('[data-del-playlist]')) return;
-        activeView = el.dataset.view; creatingPlaylist = false; selectMode = false; selectedIds.clear(); render();
+        activeView = el.dataset.view; creatingPlaylist = false; selectMode = false; selectedIds.clear();
+        reorderMode = false; reorderUndo = [];
+        delete autoOrder[activeView]; // Recent / Most played re-sort each time you open them
+        if (sortMode === 'manual' && isLibLike()) sortMode = 'added';
+        render();
       });
     });
     content.querySelectorAll('[data-del-playlist]').forEach((el) => {
@@ -1292,6 +1530,7 @@
     });
     content.querySelectorAll('[data-play]').forEach((el) => {
       el.addEventListener('click', (e) => {
+        if (reorderMode) return; // reorder mode is inert: no accidental plays
         if (e.target.closest('[data-add],[data-remove-from],[data-delete],[data-rename],[data-queue-add],[data-fav]')) return;
         if (selectMode) { toggleSelect(el.dataset.play); return; }
         playTrack(el.dataset.play);
@@ -1359,6 +1598,13 @@
   }
 
   let npEl = null;
+  let npCollapsed = false;
+  try { npCollapsed = localStorage.getItem('mattmusic-np-collapsed') === '1'; } catch (e) { /* ignore */ }
+  function toggleNpCollapsed() {
+    npCollapsed = !npCollapsed;
+    try { localStorage.setItem('mattmusic-np-collapsed', npCollapsed ? '1' : '0'); } catch (e) { /* ignore */ }
+    renderNowPlaying();
+  }
   function renderNowPlaying() {
     const track = currentId ? getTrackById(currentId) : null;
     if (!npEl) {
@@ -1366,8 +1612,10 @@
       npEl.className = 'now-playing';
       document.body.appendChild(npEl);
     }
-    if (!track) { npEl.style.display = 'none'; return; }
+    if (!track) { npEl.style.display = 'none'; document.body.classList.remove('np-collapsed'); return; }
     npEl.style.display = 'block';
+    npEl.classList.toggle('collapsed', npCollapsed);
+    document.body.classList.toggle('np-collapsed', npCollapsed);
 
     npEl.innerHTML = `
       <div class="np-inner">
@@ -1376,12 +1624,16 @@
             ? `<img class="np-art" src="${track.artUrl}" alt="" />`
             : `<span class="np-art np-art-mono" style="background:${monoColor(track.title)}">${monoLetter(track.title)}</span>`}
           <div class="np-track">${escapeHtml(track.title)}</div>
+          <button class="np-queue-btn np-mini-play" id="npMiniPlay" title="Play / pause"><span id="miniPlayIcon">${isPlaying ? iconPause() : iconPlay()}</span></button>
           <button class="np-queue-btn np-fav-btn ${track.fav ? 'on' : ''}" id="npFavBtn" title="${track.fav ? 'Remove from Favorites' : 'Add to Favorites'}">
             <svg viewBox="0 0 24 24" fill="${track.fav ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 21s-7.5-4.6-9.5-9.2C1.2 8.6 3 5 6.5 5c2 0 3.6 1.1 5.5 3 1.9-1.9 3.5-3 5.5-3C21 5 22.8 8.6 21.5 11.8 19.5 16.4 12 21 12 21z"/></svg>
           </button>
           <button class="np-queue-btn" id="queueToggleBtn" title="Up next">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h11"/></svg>
             ${queue.length ? `<span class="queue-badge">${queue.length}</span>` : ''}
+          </button>
+          <button class="np-queue-btn np-collapse-btn" id="npCollapseBtn" title="Minimize / expand player">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
           </button>
         </div>
         <canvas class="np-wave" id="waveCanvas" width="600" height="52"></canvas>
@@ -1410,6 +1662,7 @@
             <input type="range" id="musicVol" min="0" max="100" value="${Math.round(musicVolume * 100)}" aria-label="Music volume">
           </span>` : ''}
         </div>
+        <div class="np-mini-bar"><span id="miniFill"></span></div>
       </div>`;
 
     const seek = document.getElementById('seek');
@@ -1426,6 +1679,10 @@
     document.getElementById('back10Btn').addEventListener('click', () => skipBy(-10));
     document.getElementById('fwd10Btn').addEventListener('click', () => skipBy(10));
     document.getElementById('loopBtn').addEventListener('click', cycleLoop);
+    document.getElementById('npCollapseBtn').addEventListener('click', toggleNpCollapsed);
+    document.getElementById('npMiniPlay').addEventListener('click', togglePlay);
+    document.querySelector('.np-track').addEventListener('click', () => { if (npCollapsed) toggleNpCollapsed(); });
+    renderProgressOnly();
     document.getElementById('musicVol')?.addEventListener('input', (e) => setMusicVolume(e.target.value / 100));
   }
 
@@ -1444,6 +1701,7 @@
 
     const rows = items.length ? items.map((t, i) => `
       <div class="queue-item">
+        <span class="drag-handle" title="Drag to reorder">⠿</span>
         <span class="queue-pos">${i + 1}</span>
         ${t.artUrl
           ? `<img class="art-thumb" src="${t.artUrl}" alt="" />`
@@ -1485,6 +1743,7 @@
     });
     document.getElementById('closeQueueBtn').addEventListener('click', () => { queuePanelOpen = false; render(); });
     document.getElementById('clearQueueBtn')?.addEventListener('click', clearQueue);
+    enableDragSort(queueEl.querySelector('.queue-list'), '.queue-item', '.drag-handle', moveQueueTo, false);
     queueEl.querySelectorAll('[data-queue-up]').forEach((el) => {
       el.addEventListener('click', () => moveQueueItem(parseInt(el.dataset.queueUp, 10), -1));
     });
