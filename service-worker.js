@@ -1,7 +1,7 @@
 // MattMusic service worker — caches the app shell so it launches offline.
 // Your mp3 files themselves live in IndexedDB (see db.js), not the cache.
 
-const CACHE_NAME = 'mattmusic-shell-v15';
+const CACHE_NAME = 'mattmusic-shell-v16';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -29,24 +29,33 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
-// Cache-first for the app shell; falls back to network for anything else.
+// Network-first for the app code (html/js/css/manifest) so updates show up on
+// the very next launch; the cache is only the offline fallback. Big static
+// assets (rain.mp3, icons) stay cache-first so they aren't re-downloaded.
 // Cross-origin requests (e.g. searching/downloading from archive.org) are
 // left alone entirely so the service worker never interferes with them.
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   if (!event.request.url.startsWith(self.location.origin)) return;
 
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request).then((response) => {
-        // Only cache same-origin, successful responses.
-        if (response.ok && event.request.url.startsWith(self.location.origin)) {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
-        }
-        return response;
-      }).catch(() => cached);
-    })
-  );
+  const isStatic = /\/(rain\.mp3|icons\/[^/]+)$/.test(new URL(event.request.url).pathname);
+
+  const fromNetwork = () =>
+    fetch(event.request, { cache: 'no-cache' }).then((response) => {
+      if (response.ok) {
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+      }
+      return response;
+    });
+
+  if (isStatic) {
+    event.respondWith(
+      caches.match(event.request).then((cached) => cached || fromNetwork())
+    );
+  } else {
+    event.respondWith(
+      fromNetwork().catch(() => caches.match(event.request))
+    );
+  }
 });
